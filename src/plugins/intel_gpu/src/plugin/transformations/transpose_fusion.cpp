@@ -12,6 +12,8 @@
 #include "openvino/pass/pattern/op/pattern.hpp"
 #include "transpose_fusion.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/multiply.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/transpose.hpp"
@@ -28,9 +30,137 @@ namespace ov {
 namespace intel_gpu {
 
 TransposeFusion::TransposeFusion() {
+    add_matcher<TransposeTransposedMatMulMatcher>();
     add_matcher<TransposeMatMulTransposeMatcher>();
     add_matcher<TransposeMatMulMatcher>();
     add_matcher<TransposeSDPAMatcher>();
+}
+
+// This matcher removes 'transpose_b' of MatMul.
+// before: Transpose -> Multiply -> Reshape -> MatMul with transpose_b
+// after: Transpose with transposed last 2 dims -> Multiply -> Reshape -> MatMul without transpose_b
+TransposeTransposedMatMulMatcher::TransposeTransposedMatMulMatcher() {
+    auto is_fp_type = [](const ov::Output<ov::Node>& output) -> bool {
+        switch (output.get_element_type()) {
+            case ov::element::f16:
+            case ov::element::f32: return true;
+            default: return false;
+        }
+    };
+    auto not_transpose = [is_fp_type](const ov::Output<ov::Node>& output) -> bool {
+        return std::dynamic_pointer_cast<ov::op::v1::Transpose>(output.get_node_shared_ptr()) == nullptr
+               && is_fp_type(output);
+    };
+
+    auto input_a_m = any_input(not_transpose);
+    auto input_b_m = any_input(not_transpose);
+
+    auto transpose_b_order_m = wrap_type<ov::op::v0::Constant>();
+    auto transpose_b_m = wrap_type<ov::op::v1::Transpose>({input_b_m, transpose_b_order_m}, is_fp_type);
+
+    auto multiply_b_const_m = wrap_type<ov::op::v0::Constant>(consumers_count(1));
+    auto multiply_b_m = wrap_type<ov::op::v1::Multiply>({transpose_b_m, multiply_b_const_m}, is_fp_type);
+
+    auto reshape_b_const_m = wrap_type<ov::op::v0::Constant>(consumers_count(1));
+    auto reshape_b_m = wrap_type<ov::op::v1::Reshape>({multiply_b_m, reshape_b_const_m}, is_fp_type);
+
+    auto matmul_m = wrap_type<ov::op::v0::MatMul>({ input_a_m, reshape_b_m });
+
+    ov::matcher_pass_callback callback = [OV_CAPTURE_CPY_AND_THIS](Matcher& m) {
+        const auto& pattern_map = m.get_pattern_value_map();
+
+        auto matmul = std::dynamic_pointer_cast<ov::op::v0::MatMul>(pattern_map.at(matmul_m).get_node_shared_ptr());
+        if (!matmul || transformation_callback(matmul)) {
+            return false;
+        }
+
+        if (matmul->get_transpose_b()) {
+            std::cout << "@@@@@@ " << matmul->get_friendly_name() << std::endl;
+
+            bool multiplied_by_scalar = false;
+
+            auto multiply_b_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(pattern_map.at(multiply_b_const_m).get_node_shared_ptr());
+            if (multiply_b_const->get_output_shape(0).size() == 0) {
+                std::cout << "scalar!" << std::endl;
+                multiplied_by_scalar = true;
+            }
+
+            bool last_2_dims_unchanged = false;
+            if (multiplied_by_scalar) {
+                auto reshape_b = std::dynamic_pointer_cast<ov::op::v1::Reshape>(pattern_map.at(reshape_b_m).get_node_shared_ptr());
+                auto input_shape = reshape_b->get_input_partial_shape(0);
+                auto output_shape = reshape_b->get_output_partial_shape(0);
+
+                int64_t input_size = 1;
+                for (auto& dim : input_shape) {
+                    if (dim.is_static() && dim.get_max_length() > 0)
+                        input_size *= dim.get_max_length();
+                }
+
+                int64_t output_size = 1;
+                for (auto& dim : output_shape) {
+                    if (dim.is_static() && dim.get_max_length() > 0)
+                        output_size *= dim.get_max_length();
+                }
+
+                if (input_size == output_size) {
+                    if (input_shape[input_shape.size()-2].get_max_length() == output_shape[output_shape.size()-2].get_max_length() &&
+                        input_shape[input_shape.size()-1].get_max_length() == output_shape[output_shape.size()-1].get_max_length()) {
+                        std::cout << "last 2 dims are preserved by reshape!" << std::endl;
+                        last_2_dims_unchanged = true;
+                    }
+                }
+            }
+
+            if (last_2_dims_unchanged) {
+                {
+                    auto tranpose_b_order = std::dynamic_pointer_cast<ov::op::v0::Constant>(pattern_map.at(transpose_b_order_m).get_node_shared_ptr());
+                    auto order_b = tranpose_b_order->cast_vector<int64_t>();
+
+                    auto tmp = order_b[order_b.size()-1];
+                    order_b[order_b.size()-1] = order_b[order_b.size()-2];
+                    order_b[order_b.size()-2] = tmp;
+
+                    auto fused_transpoed_b_order = ov::op::v0::Constant::create(tranpose_b_order->get_element_type(),
+                                                                                tranpose_b_order->get_shape(), order_b);
+
+                    auto tranpose_b = std::dynamic_pointer_cast<ov::op::v1::Transpose>(pattern_map.at(transpose_b_m).get_node_shared_ptr());
+                    auto new_tranpose_b = std::make_shared<ov::op::v1::Transpose>(tranpose_b->get_input_node_shared_ptr(0), fused_transpoed_b_order);
+                    new_tranpose_b->set_friendly_name(tranpose_b->get_friendly_name());
+                    ov::copy_runtime_info(tranpose_b, new_tranpose_b);
+                    ov::replace_node(tranpose_b, new_tranpose_b);
+                }
+
+                {
+                    auto reshape_b_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(pattern_map.at(reshape_b_const_m).get_node_shared_ptr());
+                    auto shape_b = reshape_b_const->cast_vector<int64_t>();
+
+                    auto tmp = shape_b[shape_b.size()-1];
+                    shape_b[shape_b.size()-1] = shape_b[shape_b.size()-2];
+                    shape_b[shape_b.size()-2] = tmp;
+
+                    auto new_reshape_b_const = ov::op::v0::Constant::create(reshape_b_const->get_element_type(),
+                                                                            reshape_b_const->get_shape(), shape_b);
+
+                    auto reshape_b = std::dynamic_pointer_cast<ov::op::v1::Reshape>(pattern_map.at(reshape_b_m).get_node_shared_ptr());
+                    auto new_reshape_b = std::make_shared<ov::op::v1::Reshape>(reshape_b->get_input_node_shared_ptr(0), new_reshape_b_const, false);
+                    new_reshape_b->set_friendly_name(reshape_b->get_friendly_name());
+                    ov::copy_runtime_info(reshape_b, new_reshape_b);
+                    ov::replace_node(reshape_b, new_reshape_b);
+                }
+
+                matmul->set_transpose_b(false);
+
+                std::cout << "transpose fusion!!" << std::endl;
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    auto m = std::make_shared<ov::pass::pattern::Matcher>(matmul_m, "TransposeTransposeMatMulMatcher");
+    this->register_matcher(m, callback);
 }
 
 TransposeSDPAMatcher::TransposeSDPAMatcher() {
