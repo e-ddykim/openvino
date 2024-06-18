@@ -19,8 +19,12 @@ layout mvn_inst::calc_output_layout(mvn_node const& node, kernel_impl_params con
     } else if (input_node_layout.data_type == data_types::u8 || input_node_layout.data_type == data_types::i8) {
         output_type = data_types::f32;
     }
-
-    return layout(output_type, input_node_layout.format, input_node_layout.get_tensor());
+    auto desc = impl_param.typed_desc<mvn>();
+    if (desc->output_partial_shape.size() != 0) {
+        return layout{desc->output_partial_shape, output_type, input_node_layout.format};
+    } else {
+        return layout(output_type, input_node_layout.format, input_node_layout.get_tensor());
+    }
 }
 
 std::string mvn_inst::to_string(mvn_node const& node) {

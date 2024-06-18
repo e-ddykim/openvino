@@ -473,7 +473,7 @@ void Graph::export_model(cldnn::BinaryOutputBuffer &ob) {
 
 std::shared_ptr<ov::Model> Graph::get_runtime_model() {
     auto primitives_info = get_network()->get_primitives_info();
-    return get_runtime_model(primitives_info, true);
+    return get_runtime_model(primitives_info, false);
 }
 
 

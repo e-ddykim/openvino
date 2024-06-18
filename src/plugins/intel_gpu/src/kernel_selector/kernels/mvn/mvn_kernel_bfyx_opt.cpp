@@ -110,14 +110,23 @@ JitConstants MVNKernelBfyxOpt::GetJitConstants(const mvn_params& params, MVNKern
     auto activation_dt = GetActivationType(params);
     jit.Merge(MakeTypeJitConstants(activation_dt, "ACTIVATION"));
 
+    if (params.isReshapeFused) {
+        jit.AddConstant(MakeJitConstant("RESHAPED_OUTPUT", "1"));
+        jit.AddConstant(MakeJitConstant("OUTPUT_SHAPE_INFO_TYPE", "int"));
+    }
+
     if (!params.fused_ops.empty()) {
         std::vector<std::string> idx_order;
         if (params.inputs[0].GetDims().size() <= 4) {
             if (params.mvnMode == MVNMode::WITHIN_CHANNELS) {
-                idx_order = { "(data_set_idx / OUTPUT_FEATURE_NUM)",
-                              "(data_set_idx % OUTPUT_FEATURE_NUM)",
-                              "((in_data_set_idx + iteration_in_data_set_offset) / OUTPUT_SIZE_X)",
-                              "((in_data_set_idx + iteration_in_data_set_offset) % OUTPUT_SIZE_X)" };
+                if (params.isReshapeFused) {
+                    idx_order = { "reshaped_b", "reshaped_f", "reshaped_y", "reshaped_x" };
+                } else {
+                    idx_order = { "(data_set_idx / OUTPUT_FEATURE_NUM)",
+                                "(data_set_idx % OUTPUT_FEATURE_NUM)",
+                                "((in_data_set_idx + iteration_in_data_set_offset) / OUTPUT_SIZE_X)",
+                                "((in_data_set_idx + iteration_in_data_set_offset) % OUTPUT_SIZE_X)" };
+                }
             } else if (params.mvnMode == MVNMode::ACROSS_CHANNELS) {
                 idx_order = { "data_set_idx",
                               "((in_data_set_idx + iteration_in_data_set_offset) / (OUTPUT_SIZE_X * OUTPUT_SIZE_Y))",

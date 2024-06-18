@@ -266,6 +266,8 @@ void ocl_stream::set_arguments(kernel& kernel, const kernel_arguments_desc& args
 
     try {
         GPU_DEBUG_TRACE_DETAIL << "Set arguments for primitive: " << args_desc.layerID << " (" << kernel.get_id() << " = " << kern.get() << ")\n";
+        if (args_desc.layerID.compare("mvn:__module.down_blocks.0.resnets.0.norm1/aten::group_norm/MVN") == 0)
+            std::cout << "!" << std::endl;
         set_arguments_impl(kern, args_desc.arguments, args);
     } catch (cl::Error const& err) {
         OPENVINO_THROW(OCL_ERR_MSG_FMT(err));

@@ -36,6 +36,11 @@ struct mvn_impl : typed_primitive_impl_ocl<mvn> {
         const auto& primitive = impl_param.typed_desc<mvn>();
         auto params = get_default_params<kernel_selector::mvn_params>(impl_param, is_shape_agnostic);
 
+        // Set reshape input if it exists
+        if (primitive->input_size() == 2) {
+            params.isReshapeFused = true;
+        }
+
         params.mvnMode = primitive->across_channels() ? kernel_selector::mvn_mode::ACROSS_CHANNELS
                                                       : kernel_selector::mvn_mode::WITHIN_CHANNELS;
         params.mvnNormalizeVariance = primitive->normalize_variance;

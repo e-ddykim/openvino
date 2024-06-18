@@ -87,7 +87,7 @@ KernelsData MVNKernelBase::GetCommonKernelsData(const Params& params) const {
                      "",
                      false,
                      false,
-                     1,
+                     (orgParams.isReshapeFused ? 2 : 1),
                      GetFusedPrimitiveInputsCount(params),
                      1,
                      orgParams.is_shape_agnostic);

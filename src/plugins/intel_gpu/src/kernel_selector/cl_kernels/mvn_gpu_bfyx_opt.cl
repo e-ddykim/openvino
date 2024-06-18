@@ -14,6 +14,9 @@ __attribute__((reqd_work_group_size(LWS, 1, 1)))
 KERNEL (mvn_gpu_bfyx_opt)(
     OPTIONAL_SHAPE_INFO_ARG
     const __global INPUT0_TYPE* input,
+#if RESHAPED_OUTPUT
+    const __global OUTPUT_SHAPE_INFO_TYPE* output_shape_info,
+#endif
     __global OUTPUT_TYPE* restrict output
 #if HAS_FUSED_OPS_DECLS
     , FUSED_OPS_DECLS
@@ -131,16 +134,40 @@ KERNEL (mvn_gpu_bfyx_opt)(
     for (uint i=0; i<items_num; ++i) {
         uint iteration_in_data_set_offset = i * workers_per_data_set;
         ACTIVATION_TYPE result = (TO_ACTIVATION_TYPE(input[my_data_offset + iteration_in_data_set_offset]) - TO_ACTIVATION_TYPE(my_sum)) * TO_ACTIVATION_TYPE(my_variance);
-#   if HAS_FUSED_OPS
-        FUSED_OPS;
-        output[my_data_offset + iteration_in_data_set_offset] = FUSED_OPS_RESULT;
-#   else
-        output[my_data_offset + iteration_in_data_set_offset] = TO_OUTPUT_TYPE(ACTIVATION(result, ACTIVATION_PARAMS));
-#   endif
+
+        #if RESHAPED_OUTPUT
+            uint output_addr = my_data_offset + iteration_in_data_set_offset;
+            uint reshaped_x = output_addr % output_shape_info[3];
+            output_addr = output_addr / output_shape_info[3];
+            uint reshaped_y = output_addr % output_shape_info[2];
+            output_addr = output_addr / output_shape_info[2];
+            uint reshaped_f = output_addr % output_shape_info[1];
+            output_addr = output_addr / output_shape_info[1];
+            uint reshaped_b = output_addr;
+        #endif
+
+        #if HAS_FUSED_OPS
+            FUSED_OPS;
+            output[my_data_offset + iteration_in_data_set_offset] = FUSED_OPS_RESULT;
+        #else
+            output[my_data_offset + iteration_in_data_set_offset] = TO_OUTPUT_TYPE(ACTIVATION(result, ACTIVATION_PARAMS));
+        #endif
     }
     if (in_data_set_idx < leftovers) {
         uint iteration_in_data_set_offset = items_num * workers_per_data_set;
         ACTIVATION_TYPE result = (TO_ACTIVATION_TYPE(input[my_data_offset + iteration_in_data_set_offset]) - TO_ACTIVATION_TYPE(my_sum)) * TO_ACTIVATION_TYPE(my_variance);
+
+        #if RESHAPED_OUTPUT
+            uint output_addr = my_data_offset + iteration_in_data_set_offset;
+            uint reshaped_x = output_addr % output_shape_info[3];
+            output_addr = output_addr / output_shape_info[3];
+            uint reshaped_y = output_addr % output_shape_info[2];
+            output_addr = output_addr / output_shape_info[2];
+            uint reshaped_f = output_addr % output_shape_info[1];
+            output_addr = output_addr / output_shape_info[1];
+            uint reshaped_b = output_addr;
+        #endif
+
 #   if HAS_FUSED_OPS
         FUSED_OPS;
         output[my_data_offset + iteration_in_data_set_offset] = FUSED_OPS_RESULT;

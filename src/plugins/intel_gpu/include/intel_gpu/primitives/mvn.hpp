@@ -34,6 +34,24 @@ struct mvn : public primitive_base<mvn> {
           eps_inside_sqrt(eps_inside_sqrt),
           reduction_axes(reduction_axes) {}
 
+    mvn(const primitive_id& id,
+        const input_info& input,
+        const input_info& pattern_id,
+        const bool normalize_variance,
+        const float epsilon,
+        const bool eps_inside_sqrt,
+        const std::vector<int64_t>& reduction_axes,
+        bool special_zero,
+        const ov::PartialShape& output_partial_shape,
+        const padding& output_padding = padding())
+        : primitive_base(id, {input, pattern_id}, {output_padding}),
+          normalize_variance(normalize_variance),
+          epsilon(epsilon),
+          eps_inside_sqrt(eps_inside_sqrt),
+          reduction_axes(reduction_axes),
+          special_zero(special_zero),
+          output_partial_shape(output_partial_shape) {}
+
     /// @brief Determines if normalize variance is applied.
     bool normalize_variance;
     /// @brief Epsilon for not dividing by zero while normalizing.
@@ -42,6 +60,9 @@ struct mvn : public primitive_base<mvn> {
     bool eps_inside_sqrt = false;
     /// @brief Determines axes set for normalization.
     std::vector<int64_t> reduction_axes;
+
+    bool special_zero = false;
+    ov::PartialShape output_partial_shape;
 
     size_t hash() const override {
         size_t seed = primitive::hash();
@@ -61,7 +82,8 @@ struct mvn : public primitive_base<mvn> {
         return normalize_variance == rhs_casted.normalize_variance &&
                epsilon == rhs_casted.epsilon &&
                eps_inside_sqrt == rhs_casted.eps_inside_sqrt &&
-               reduction_axes == rhs_casted.reduction_axes;
+               reduction_axes == rhs_casted.reduction_axes &&
+               special_zero == rhs_casted.special_zero;
     }
 
     void save(BinaryOutputBuffer& ob) const override {
@@ -70,6 +92,8 @@ struct mvn : public primitive_base<mvn> {
         ob << epsilon;
         ob << eps_inside_sqrt;
         ob << reduction_axes;
+        ob << special_zero;
+        ob << output_partial_shape;
     }
 
     void load(BinaryInputBuffer& ib) override {
@@ -78,6 +102,8 @@ struct mvn : public primitive_base<mvn> {
         ib >> epsilon;
         ib >> eps_inside_sqrt;
         ib >> reduction_axes;
+        ib >> special_zero;
+        ib >> output_partial_shape;
     }
 
     bool across_channels() const {

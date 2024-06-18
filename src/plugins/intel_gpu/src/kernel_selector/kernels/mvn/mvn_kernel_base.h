@@ -19,6 +19,7 @@ struct mvn_params : public base_params {
     bool mvnNormalizeVariance = false;
     float epsilon = 0.0f;
     MVNEpsMode mvnEpsMode = MVNEpsMode::INSIDE_SQRT;
+    bool isReshapeFused = false;
 
     ParamsKey GetParamsKey() const override {
         ParamsKey k = base_params::GetParamsKey();
