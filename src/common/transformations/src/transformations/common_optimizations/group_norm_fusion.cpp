@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include "group_norm_composition.hpp"
+#include "transformations/common_optimizations/group_norm_fusion.hpp"
 
+#include "itt.hpp"
 #include "openvino/core/rt_info.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/multiply.hpp"
@@ -18,14 +19,12 @@
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 #include "transformations/utils/utils.hpp"
 
-namespace ov {
-namespace intel_gpu {
+using namespace ov::pass::pattern;
+using ov::pass::pattern::op::Or;
 
-GroupNormComposition::GroupNormComposition() {
-    using namespace ov::pass::pattern;
-    using ov::pass::pattern::op::Or;
-
-    // Detect Group-Normalization decomposition pattern
+ov::pass::GroupNormFusion::GroupNormFusion() {
+    MATCHER_SCOPE(GroupNormFusion);
+    // Replaces a decomposed GroupNormalization sub-graph with a GroupNormalization op.
     // y = scale * MVN(x) + bias
     auto data_m = any_input();
     auto pre_reshape_const_m = wrap_type<ov::op::v0::Constant>();
@@ -34,13 +33,13 @@ GroupNormComposition::GroupNormComposition() {
     auto mvn_m = wrap_type<ov::op::v6::MVN>({pre_reshape_m, axes_const_m});
     auto shapeof_m = wrap_type<ov::op::v3::ShapeOf>({data_m});
     auto post_reshape_m = wrap_type<ov::op::v1::Reshape>({mvn_m, shapeof_m});
-    auto scale_const_m = wrap_type<ov::op::v0::Constant>();
-    auto convert_scale_const_m = wrap_type<ov::op::v0::Convert>({scale_const_m});
-    auto scale_m = std::make_shared<Or>(OutputVector{scale_const_m, convert_scale_const_m});
+    auto scale_input_m = any_input();
+    auto convert_scale_input_m = wrap_type<ov::op::v0::Convert>({scale_input_m});
+    auto scale_m = std::make_shared<Or>(OutputVector{scale_input_m, convert_scale_input_m});
     auto mul_m = wrap_type<ov::op::v1::Multiply>({post_reshape_m, scale_m});
-    auto bias_const_m = wrap_type<ov::op::v0::Constant>();
-    auto convert_bias_const_m = wrap_type<ov::op::v0::Convert>({bias_const_m});
-    auto bias_m = std::make_shared<Or>(OutputVector{bias_const_m, convert_bias_const_m});
+    auto bias_input_m = any_input();
+    auto convert_bias_input_m = wrap_type<ov::op::v0::Convert>({bias_input_m});
+    auto bias_m = std::make_shared<Or>(OutputVector{bias_input_m, convert_bias_input_m});
     auto add_m = wrap_type<ov::op::v1::Add>({mul_m, bias_m});
 
     ov::matcher_pass_callback callback = [=](ov::pass::pattern::Matcher& m) {
@@ -54,49 +53,66 @@ GroupNormComposition::GroupNormComposition() {
         }
         auto feature_dim = data_pshape[1].get_max_length();
 
-        auto scale = pattern_map.at(scale_const_m);
+        auto scale = pattern_map.at(scale_input_m);
         {
             // The total number of elements in scale must be equal to feature_dim.
-            auto const_scale = std::dynamic_pointer_cast<ov::op::v0::Constant>(scale.get_node_shared_ptr());
-            auto const_scale_shape = const_scale->get_output_shape(0);
-            int64_t const_scale_size = 1;
-            for (auto& dim : const_scale_shape) {
-                const_scale_size *= dim;
+            if (scale.get_partial_shape().is_dynamic()) {
+                return false;
             }
-            if (const_scale_size != feature_dim) {
+            auto scale_shape = scale.get_shape();
+            int64_t scale_size = 1;
+            for (auto& dim : scale_shape) {
+                scale_size *= dim;
+            }
+            if (scale_size != feature_dim) {
                 return false;
             }
         }
-        if (pattern_map.count(convert_scale_const_m) != 0) {
-            scale = pattern_map.at(convert_scale_const_m);
+        if (pattern_map.count(convert_scale_input_m) != 0) {
+            scale = pattern_map.at(convert_scale_input_m);
         }
         auto scale_1d = std::make_shared<ov::op::v0::Squeeze>(scale);
-        auto bias = pattern_map.at(bias_const_m);
+        scale_1d->get_rt_info()["fused_names_0"] = scale.get_any_name();
+        auto bias = pattern_map.at(bias_input_m);
         {
             // The total number of elements in bias must be equal to feature_dim.
-            auto const_bias = std::dynamic_pointer_cast<ov::op::v0::Constant>(bias.get_node_shared_ptr());
-            auto const_bias_shape = const_bias->get_output_shape(0);
-            int64_t const_bias_size = 1;
-            for (auto& dim : const_bias_shape) {
-                const_bias_size *= dim;
+            if (bias.get_partial_shape().is_dynamic()) {
+                return false;
             }
-            if (const_bias_size != feature_dim) {
+            auto bias_shape = bias.get_shape();
+            int64_t bias_size = 1;
+            for (auto& dim : bias_shape) {
+                bias_size *= dim;
+            }
+            if (bias_size != feature_dim) {
                 return false;
             }
         }
-        if (pattern_map.count(convert_bias_const_m) != 0) {
-            bias = pattern_map.at(convert_bias_const_m);
+        if (pattern_map.count(convert_bias_input_m) != 0) {
+            bias = pattern_map.at(convert_bias_input_m);
         }
         auto bias_1d = std::make_shared<ov::op::v0::Squeeze>(bias);
+        bias_1d->get_rt_info()["fused_names_0"] = bias.get_any_name();
 
         auto pre_reshape = std::dynamic_pointer_cast<ov::op::v1::Reshape>(pattern_map.at(pre_reshape_m).get_node_shared_ptr());
         auto pre_reshape_pshape = pre_reshape->get_output_partial_shape(0);
+        // Feature dim should be static.
+        if (pre_reshape_pshape[1].is_dynamic()) {
+            return false;
+        }
         auto num_groups = pre_reshape_pshape[1].get_max_length();
+        // Feature dim should be divided by the number of groups.
+        if ((feature_dim % num_groups) != 0) {
+            return false;
+        }
 
         auto mvn = std::dynamic_pointer_cast<ov::op::v6::MVN>(pattern_map.at(mvn_m).get_node_shared_ptr());
+        // MVNEpsMode should be inside_sqrt.
+        if (mvn->get_eps_mode() != ov::op::MVNEpsMode::INSIDE_SQRT) {
+            return false;
+        }
 
         auto group_norm = std::make_shared<ov::op::v12::GroupNormalization>(data, scale_1d, bias_1d, num_groups, mvn->get_eps());
-
         group_norm->set_friendly_name(m.get_match_root()->get_friendly_name());
         ov::copy_runtime_info(m.get_matched_nodes(), group_norm);
         ov::replace_node(m.get_match_root(), group_norm);
@@ -104,9 +120,6 @@ GroupNormComposition::GroupNormComposition() {
         return true;
     };
 
-    auto m = std::make_shared<ov::pass::pattern::Matcher>(add_m, "GroupNormComposition");
+    auto m = std::make_shared<ov::pass::pattern::Matcher>(add_m, "GroupNormFusion");
     this->register_matcher(m, callback);
 }
-
-}  // namespace intel_gpu
-}  // namespace ov
