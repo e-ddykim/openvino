@@ -13,6 +13,9 @@ KERNEL(calc_mean_per_feature)(
     OPTIONAL_SHAPE_INFO_ARG
     const __global INPUT0_TYPE* input,
     __global ACCUMULATOR_TYPE* internal_mean
+    #if IS_QUANTIZED
+        , __global ACCUMULATOR_TYPE* internal_max
+    #endif
 ) {
     #if INPUT0_DIMS == 5
         const uint bf = get_global_id(2) / LWS2;     // batch * feature
@@ -40,6 +43,9 @@ KERNEL(calc_mean_per_feature)(
     const uint x_leftover = INPUT0_SIZE_X - x_num_workers * x_block_size;
 
     ACCUMULATOR_TYPE mean = ACCUMULATOR_VAL_ZERO;
+    #if IS_QUANTIZED
+        ACCUMULATOR_TYPE max = ACCUMULATOR_VAL_ZERO;
+    #endif
 
     #if INPUT0_DIMS == 5
         for (uint z = z_base; z < (z_base + z_block_size); ++z) {
@@ -52,6 +58,9 @@ KERNEL(calc_mean_per_feature)(
                 #endif
                 for (uint i = 0; i < x_block_size; ++i) {
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]);
+                    #if IS_QUANTIZED
+                        max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]));
+                    #endif
                 }
             }
     #if INPUT0_DIMS == 5
@@ -64,6 +73,9 @@ KERNEL(calc_mean_per_feature)(
                 uint my_data_offset = INPUT0_GET_INDEX(b, f, (get_local_id(2) + z_num_workers * z_block_size), y, x_base);
                 for (uint i = 0; i < x_block_size; ++i) {
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]);
+                    #if IS_QUANTIZED
+                        max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]));
+                    #endif
                 }
             }
         }
@@ -78,6 +90,9 @@ KERNEL(calc_mean_per_feature)(
         #endif
                 for (uint i = 0; i < x_block_size; ++i) {
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]);
+                    #if IS_QUANTIZED
+                        max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]));
+                    #endif
                 }
         #if INPUT0_DIMS == 5
             }
@@ -95,6 +110,9 @@ KERNEL(calc_mean_per_feature)(
                         uint my_data_offset = INPUT0_GET_INDEX(b, f, y, (get_local_id(0) + x_num_workers * x_block_size));
                     #endif
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset]);
+                    #if IS_QUANTIZED
+                        max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset]));
+                    #endif
                 }
         #if INPUT0_DIMS == 5
             }
@@ -112,6 +130,9 @@ KERNEL(calc_mean_per_feature)(
                                                          (get_local_id(0) + x_num_workers * x_block_size));
     #endif
             mean += TO_ACCUMULATOR_TYPE(input[my_data_offset]);
+            #if IS_QUANTIZED
+                max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset]));
+            #endif
         }
 
     #if INPUT0_DIMS == 5
@@ -122,10 +143,16 @@ KERNEL(calc_mean_per_feature)(
     const uint worker_idx = get_local_linear_id();
 
     mean = work_group_reduce_add(mean);
+    #if IS_QUANTIZED
+        max = work_group_reduce_max(max);
+    #endif
 
     if (worker_idx == 0) {
         mean = mean / TO_ACCUMULATOR_TYPE(INPUT0_SIZE_Z * INPUT0_SIZE_Y * INPUT0_SIZE_X);
         internal_mean[bf] = mean;
+        #if IS_QUANTIZED
+            internal_max[bf] = max;
+        #endif
     }
 }
 #elif GROUP_NORM_KERNEL_GROUP_MEAN
@@ -134,6 +161,9 @@ __attribute__((reqd_work_group_size(LWS0, LWS1, LWS2)))
 #endif
 KERNEL(calc_mean_per_group)(
     __global ACCUMULATOR_TYPE* internal_mean
+    #if IS_QUANTIZED
+        , __global ACCUMULATOR_TYPE* internal_max
+    #endif
 ) {
     const uint data_idx = get_global_id(0) + get_global_id(1) * GWS0;
     const uint num_workers = LWS0;
@@ -142,14 +172,26 @@ KERNEL(calc_mean_per_group)(
 
     if ((data_idx % group_size) < num_workers) {
         ACCUMULATOR_TYPE my_sum = ACCUMULATOR_VAL_ZERO;
+        #if IS_QUANTIZED
+            ACCUMULATOR_TYPE my_max = ACCUMULATOR_VAL_ZERO;
+        #endif
         for (uint i = 0; i < items_num; ++i) {
             my_sum += internal_mean[data_idx + num_workers * i];
+            #if IS_QUANTIZED
+                my_max = ACCUMULATOR_MAX_FUNC(my_max, internal_max[data_idx + num_workers * i]);
+            #endif
         }
 
         ACCUMULATOR_TYPE mean = work_group_reduce_add(my_sum);
         mean /= TO_ACCUMULATOR_TYPE(group_size);
+        #if IS_QUANTIZED
+            ACCUMULATOR_TYPE max = work_group_reduce_max(my_max);
+        #endif
         for (uint i = 0; i < items_num; ++i) {
             internal_mean[data_idx + num_workers * i] = mean;
+            #if IS_QUANTIZED
+                internal_max[data_idx + num_workers * i] = max;
+            #endif
         }
     }
 }
@@ -314,6 +356,49 @@ KERNEL(calc_var_per_group)(
         }
     }
 }
+#elif GROUP_NORM_MAX
+#if !IS_DYNAMIC
+__attribute__((reqd_work_group_size(LWS0, LWS1, LWS2)))
+#endif
+KERNEL(group_normalization_b_fs_yx_fsv16)(
+    OPTIONAL_SHAPE_INFO_ARG
+    const __global INPUT0_TYPE* input,
+    const __global INPUT1_TYPE* scale,
+    const __global INPUT2_TYPE* bias,
+    const __global OUTPUT_TYPE* restrict output,
+    __global INPUT0_TYPE* restrict output_scale,
+#if HAS_FUSED_OPS_DECLS
+    FUSED_OPS_DECLS,
+#endif
+    const __global ACCUMULATOR_TYPE* internal_mean,
+    const __global ACCUMULATOR_TYPE* internal_variance,
+    __global ACCUMULATOR_TYPE* internal_max
+) {
+    const uint b = get_global_id(1);
+    const uint f = get_global_id(0);
+    const uint bf = b * INPUT0_FEATURE_NUM + f;
+
+    ACTIVATION_TYPE mean = TO_ACTIVATION_TYPE(internal_mean[bf]);
+    ACTIVATION_TYPE variance = TO_ACTIVATION_TYPE(internal_variance[bf]);
+    ACTIVATION_TYPE normalized = (TO_ACTIVATION_TYPE(internal_max[bf]) - mean) * variance;
+    normalized = normalized * TO_ACTIVATION_TYPE(scale[f]) + TO_ACTIVATION_TYPE(bias[f]);
+    // swish
+    normalized /= ACTIVATION_VAL_ONE + exp(-(ACTIVATION_VAL_ONE * normalized));
+
+    // OUTPUT_TYPE res;
+    // #if HAS_FUSED_OPS
+    //     FUSED_OPS;
+    //     res = FUSED_OPS_RESULT;
+    // #else
+    //     res = TO_OUTPUT_TYPE(ACTIVATION(normalized, ACTIVATION_PARAMS));
+    // #endif
+    normalized = work_group_reduce_max(normalized);
+
+    internal_max[bf] = TO_ACCUMULATOR_TYPE(normalized);
+    if (f == 0) {
+        output_scale[b] = TO_INPUT0_TYPE(internal_max[bf] / 16384.0);
+    }
+}
 #elif GROUP_NORM_KERNEL_FINAL
 #if !IS_DYNAMIC
 __attribute__((reqd_work_group_size(LWS0, LWS1, LWS2)))
@@ -324,11 +409,15 @@ KERNEL(group_normalization_b_fs_yx_fsv16)(
     const __global INPUT1_TYPE* scale,
     const __global INPUT2_TYPE* bias,
     __global OUTPUT_TYPE* restrict output,
+    const __global INPUT0_TYPE* restrict output_scale,
 #if HAS_FUSED_OPS_DECLS
     FUSED_OPS_DECLS,
 #endif
     const __global ACCUMULATOR_TYPE* internal_mean,
     const __global ACCUMULATOR_TYPE* internal_variance
+#if IS_QUANTIZED
+    , __global ACCUMULATOR_TYPE* internal_max
+#endif
 ) {
     const uint bf = get_global_id(1);
     const uint b = bf / OUTPUT_FEATURE_NUM;
@@ -359,11 +448,26 @@ KERNEL(group_normalization_b_fs_yx_fsv16)(
     #else
         const uint output_data_index = OUTPUT_GET_INDEX(b, f, y, x);
     #endif
-    #if HAS_FUSED_OPS
-        FUSED_OPS;
-        output[output_data_index] = FUSED_OPS_RESULT;
+    #if IS_QUANTIZED
+        // swish
+        normalized /= ACTIVATION_VAL_ONE + exp(-(ACTIVATION_VAL_ONE * normalized));
+        // quantization
+        normalized /= TO_ACTIVATION_TYPE(output_scale[b]);
+        OUTPUT_TYPE res;
+        #if HAS_FUSED_OPS
+            FUSED_OPS;
+            res = FUSED_OPS_RESULT;
+        #else
+            res = TO_OUTPUT_TYPE(ACTIVATION(normalized, ACTIVATION_PARAMS));
+        #endif
+        output[output_data_index] = res;// / TO_OUTPUT_TYPE(internal_max[bf]) * TO_OUTPUT_TYPE(16384);
     #else
-        output[output_data_index] = TO_OUTPUT_TYPE(ACTIVATION(normalized, ACTIVATION_PARAMS));
+        #if HAS_FUSED_OPS
+            FUSED_OPS;
+            output[output_data_index] = FUSED_OPS_RESULT;
+        #else
+            output[output_data_index] = TO_OUTPUT_TYPE(ACTIVATION(normalized, ACTIVATION_PARAMS));
+        #endif
     #endif
 }
 #endif
