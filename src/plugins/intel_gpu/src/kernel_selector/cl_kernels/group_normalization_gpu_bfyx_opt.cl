@@ -13,7 +13,7 @@ KERNEL(calc_mean_per_feature)(
     OPTIONAL_SHAPE_INFO_ARG
     const __global INPUT0_TYPE* input,
     __global ACCUMULATOR_TYPE* internal_mean
-    #if IS_QUANTIZED
+    #ifdef IS_QUANTIZED
         , __global ACCUMULATOR_TYPE* internal_max
     #endif
 ) {
@@ -43,7 +43,7 @@ KERNEL(calc_mean_per_feature)(
     const uint x_leftover = INPUT0_SIZE_X - x_num_workers * x_block_size;
 
     ACCUMULATOR_TYPE mean = ACCUMULATOR_VAL_ZERO;
-    #if IS_QUANTIZED
+    #ifdef IS_QUANTIZED
         ACCUMULATOR_TYPE max = ACCUMULATOR_VAL_ZERO;
     #endif
 
@@ -58,7 +58,7 @@ KERNEL(calc_mean_per_feature)(
                 #endif
                 for (uint i = 0; i < x_block_size; ++i) {
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]);
-                    #if IS_QUANTIZED
+                    #ifdef IS_QUANTIZED
                         max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]));
                     #endif
                 }
@@ -73,7 +73,7 @@ KERNEL(calc_mean_per_feature)(
                 uint my_data_offset = INPUT0_GET_INDEX(b, f, (get_local_id(2) + z_num_workers * z_block_size), y, x_base);
                 for (uint i = 0; i < x_block_size; ++i) {
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]);
-                    #if IS_QUANTIZED
+                    #ifdef IS_QUANTIZED
                         max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]));
                     #endif
                 }
@@ -90,7 +90,7 @@ KERNEL(calc_mean_per_feature)(
         #endif
                 for (uint i = 0; i < x_block_size; ++i) {
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]);
-                    #if IS_QUANTIZED
+                    #ifdef IS_QUANTIZED
                         max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset + i * x_num_workers]));
                     #endif
                 }
@@ -110,7 +110,7 @@ KERNEL(calc_mean_per_feature)(
                         uint my_data_offset = INPUT0_GET_INDEX(b, f, y, (get_local_id(0) + x_num_workers * x_block_size));
                     #endif
                     mean += TO_ACCUMULATOR_TYPE(input[my_data_offset]);
-                    #if IS_QUANTIZED
+                    #ifdef IS_QUANTIZED
                         max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset]));
                     #endif
                 }
@@ -130,7 +130,7 @@ KERNEL(calc_mean_per_feature)(
                                                          (get_local_id(0) + x_num_workers * x_block_size));
     #endif
             mean += TO_ACCUMULATOR_TYPE(input[my_data_offset]);
-            #if IS_QUANTIZED
+            #ifdef IS_QUANTIZED
                 max = ACCUMULATOR_MAX_FUNC(max, TO_ACCUMULATOR_TYPE(input[my_data_offset]));
             #endif
         }
@@ -143,14 +143,14 @@ KERNEL(calc_mean_per_feature)(
     const uint worker_idx = get_local_linear_id();
 
     mean = work_group_reduce_add(mean);
-    #if IS_QUANTIZED
+    #ifdef IS_QUANTIZED
         max = work_group_reduce_max(max);
     #endif
 
     if (worker_idx == 0) {
         mean = mean / TO_ACCUMULATOR_TYPE(INPUT0_SIZE_Z * INPUT0_SIZE_Y * INPUT0_SIZE_X);
         internal_mean[bf] = mean;
-        #if IS_QUANTIZED
+        #ifdef IS_QUANTIZED
             internal_max[bf] = max;
         #endif
     }
@@ -161,7 +161,7 @@ __attribute__((reqd_work_group_size(LWS0, LWS1, LWS2)))
 #endif
 KERNEL(calc_mean_per_group)(
     __global ACCUMULATOR_TYPE* internal_mean
-    #if IS_QUANTIZED
+    #ifdef IS_QUANTIZED
         , __global ACCUMULATOR_TYPE* internal_max
     #endif
 ) {
@@ -172,24 +172,24 @@ KERNEL(calc_mean_per_group)(
 
     if ((data_idx % group_size) < num_workers) {
         ACCUMULATOR_TYPE my_sum = ACCUMULATOR_VAL_ZERO;
-        #if IS_QUANTIZED
+        #ifdef IS_QUANTIZED
             ACCUMULATOR_TYPE my_max = ACCUMULATOR_VAL_ZERO;
         #endif
         for (uint i = 0; i < items_num; ++i) {
             my_sum += internal_mean[data_idx + num_workers * i];
-            #if IS_QUANTIZED
+            #ifdef IS_QUANTIZED
                 my_max = ACCUMULATOR_MAX_FUNC(my_max, internal_max[data_idx + num_workers * i]);
             #endif
         }
 
         ACCUMULATOR_TYPE mean = work_group_reduce_add(my_sum);
         mean /= TO_ACCUMULATOR_TYPE(group_size);
-        #if IS_QUANTIZED
+        #ifdef IS_QUANTIZED
             ACCUMULATOR_TYPE max = work_group_reduce_max(my_max);
         #endif
         for (uint i = 0; i < items_num; ++i) {
             internal_mean[data_idx + num_workers * i] = mean;
-            #if IS_QUANTIZED
+            #ifdef IS_QUANTIZED
                 internal_max[data_idx + num_workers * i] = max;
             #endif
         }
@@ -396,7 +396,8 @@ KERNEL(group_normalization_b_fs_yx_fsv16)(
 
     internal_max[bf] = TO_ACCUMULATOR_TYPE(normalized);
     if (f == 0) {
-        output_scale[b] = TO_INPUT0_TYPE(internal_max[bf] / 16384.0);
+        output_scale[b] = TO_INPUT0_TYPE(internal_max[bf] / 1.f);
+        printf("internal_max: %f\n", internal_max[bf]);
     }
 }
 #elif GROUP_NORM_KERNEL_FINAL
@@ -409,13 +410,15 @@ KERNEL(group_normalization_b_fs_yx_fsv16)(
     const __global INPUT1_TYPE* scale,
     const __global INPUT2_TYPE* bias,
     __global OUTPUT_TYPE* restrict output,
+#ifdef IS_QUANTIZED
     const __global INPUT0_TYPE* restrict output_scale,
+#endif
 #if HAS_FUSED_OPS_DECLS
     FUSED_OPS_DECLS,
 #endif
     const __global ACCUMULATOR_TYPE* internal_mean,
     const __global ACCUMULATOR_TYPE* internal_variance
-#if IS_QUANTIZED
+#ifdef IS_QUANTIZED
     , __global ACCUMULATOR_TYPE* internal_max
 #endif
 ) {
@@ -448,7 +451,7 @@ KERNEL(group_normalization_b_fs_yx_fsv16)(
     #else
         const uint output_data_index = OUTPUT_GET_INDEX(b, f, y, x);
     #endif
-    #if IS_QUANTIZED
+    #ifdef IS_QUANTIZED
         // swish
         normalized /= ACTIVATION_VAL_ONE + exp(-(ACTIVATION_VAL_ONE * normalized));
         // quantization

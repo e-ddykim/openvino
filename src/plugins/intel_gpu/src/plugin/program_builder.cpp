@@ -16,6 +16,7 @@
 #include "intel_gpu/primitives/data.hpp"
 #include "intel_gpu/op/fully_connected_compressed.hpp"
 #include "intel_gpu/op/placeholder.hpp"
+#include "intel_gpu/op/group_norm_quantize.hpp"
 #include "openvino/util/pp.hpp"
 
 #ifdef __linux__
@@ -263,10 +264,11 @@ std::vector<cldnn::input_info> ProgramBuilder::GetInputInfo(const std::shared_pt
         // Note: Currently Split/Variadic Split are divided to multiple crops
         // LSTMCell contains its own body network, and each output has a unique pid
         // But there is no need to maintain output port index for the next node e.g. Result
-        bool is_legacy_multiple_outputs = !allow_new_shape_infer
+        bool is_legacy_multiple_outputs = !ov::is_type<ov::intel_gpu::op::GroupNormQuantize>(prevOp)
+                                          && (!allow_new_shape_infer
                                           || ov::is_type<ov::op::v1::Split>(prevOp)
                                           || ov::is_type<ov::op::v1::VariadicSplit>(prevOp)
-                                          || ov::is_type<ov::op::v4::LSTMCell>(prevOp);
+                                          || ov::is_type<ov::op::v4::LSTMCell>(prevOp));
         if (prevOp->get_output_size() > 1 && is_legacy_multiple_outputs) {
             prevName += ".out" + std::to_string(op->get_input_source_output(i).get_index());
         }

@@ -3,11 +3,13 @@
 //
 #include "group_norm_quantize_kernel_selector.h"
 #include "group_norm_quantize_kernel_bfyx_opt.h"
+#include "group_norm_quantize_kernel_b_fs_yx_fsv16.h"
 
 namespace kernel_selector {
 
 group_norm_quantize_kernel_selector::group_norm_quantize_kernel_selector() {
     Attach<GroupNormQuantizeKernelBfyx>();
+    Attach<GroupNormQuantizeKernel_b_fs_yx_fsv16>();
 }
 
 KernelsData group_norm_quantize_kernel_selector::GetBestKernels(const Params &params) const {
