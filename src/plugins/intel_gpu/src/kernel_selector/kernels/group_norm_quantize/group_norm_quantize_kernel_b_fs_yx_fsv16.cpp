@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include "group_norm_quantize_kernel_bfyx_opt.h"
+#include "group_norm_quantize_kernel_b_fs_yx_fsv16.h"
 #include "kernel_selector_utils.h"
 
 namespace kernel_selector {
-ParamsKey GroupNormQuantizeKernelBfyx::GetSupportedKey() const {
+
+static constexpr size_t fsv = 16;
+static constexpr size_t simd = fsv;
+
+ParamsKey GroupNormQuantizeKernel_b_fs_yx_fsv16::GetSupportedKey() const {
     ParamsKey k;
     k.EnableInputDataType(Datatype::F16);
     k.EnableInputDataType(Datatype::F32);
@@ -16,64 +20,39 @@ ParamsKey GroupNormQuantizeKernelBfyx::GetSupportedKey() const {
     k.EnableOutputDataType(Datatype::F32);
     k.EnableOutputDataType(Datatype::INT8);
     k.EnableOutputDataType(Datatype::UINT8);
-    k.EnableInputLayout(DataLayout::bfyx);
-    k.EnableInputLayout(DataLayout::bfzyx);
-    k.EnableOutputLayout(DataLayout::bfyx);
-    k.EnableOutputLayout(DataLayout::bfzyx);
-    k.EnableBatching();
+    k.EnableInputLayout(DataLayout::b_fs_yx_fsv16);
+    k.EnableOutputLayout(DataLayout::b_fs_yx_fsv16);
     k.EnableTensorOffset();
     k.EnableTensorPitches();
+    k.EnableBatching();
     k.EnableDifferentTypes();
     k.EnableDynamicShapesSupport();
     return k;
 }
 
-GroupNormQuantizeKernelBase::MultiDispatchData GroupNormQuantizeKernelBfyx::SetDefault(const group_norm_quantize_params &params) const {
+GroupNormQuantizeKernelBase::MultiDispatchData GroupNormQuantizeKernel_b_fs_yx_fsv16::SetDefault(const group_norm_quantize_params &params) const {
     MultiDispatchData dispatchData;
 
     if (!params.has_dynamic_tensors()) {
         const auto& input = params.inputs[0];
 
-        dispatchData.stage_1.gws[0] = input.X().v;
-        dispatchData.stage_1.gws[1] = input.Y().v;
-        dispatchData.stage_1.gws[2] = input.Z().v * input.Feature().v * input.Batch().v;
+        dispatchData.stage_1.gws[0] = input.X().v * input.Y().v;
+        dispatchData.stage_1.gws[1] = CeilDiv(input.Feature().v, fsv) * input.Batch().v;
+        dispatchData.stage_1.gws[2] = 1;
 
-        dispatchData.stage_1.lws[0] = input.X().v;
-        dispatchData.stage_1.lws[1] = input.Y().v;
-        dispatchData.stage_1.lws[2] = input.Z().v;
+        dispatchData.stage_1.lws[0] = input.X().v * input.Y().v;
+        dispatchData.stage_1.lws[1] = 1;
+        dispatchData.stage_1.lws[2] = 1;
 
-        if ((input.X().v * input.Y().v * input.Z().v) > params.engineInfo.maxWorkGroupSize) {
-            if (input.Z().v > params.engineInfo.maxWorkGroupSize) {
-                dispatchData.stage_1.lws[0] = 1;
-                dispatchData.stage_1.lws[1] = 1;
-                for (size_t lws = 2; lws <= input.Z().v; ++lws) {
-                    if (input.Z().v % lws == 0 && (input.Z().v / lws) <= params.engineInfo.maxWorkGroupSize) {
-                        dispatchData.stage_1.lws[2] = input.Z().v / lws;
-                        dispatchData.stage_1.gws[2] = dispatchData.stage_1.lws[2] * input.Feature().v * input.Batch().v;
-                        break;
-                    }
-                }
-            } else {
-                if ((input.Y().v * input.Z().v) > params.engineInfo.maxWorkGroupSize) {
-                    dispatchData.stage_1.lws[0] = 1;
-                    for (size_t lws = 2; lws <= input.Y().v; ++lws) {
-                        if (input.Y().v % lws == 0 && (input.Y().v / lws * input.Z().v) <= params.engineInfo.maxWorkGroupSize) {
-                            dispatchData.stage_1.lws[1] = input.Y().v / lws;
-                            break;
-                        }
-                    }
-                } else {
-                    for (size_t lws = 2; lws <= input.X().v; ++lws) {
-                        if (input.X().v % lws == 0 && (input.X().v / lws * input.Y().v * input.Z().v) <= params.engineInfo.maxWorkGroupSize) {
-                            dispatchData.stage_1.lws[0] = input.X().v / lws;
-                            break;
-                        }
-                    }
-                }
+        size_t divisor = 2;
+        while (dispatchData.stage_1.lws[0] > (params.engineInfo.maxWorkGroupSize / fsv)) {
+            if (dispatchData.stage_1.gws[0] % divisor == 0) {
+                dispatchData.stage_1.lws[0] = dispatchData.stage_1.gws[0] / divisor;
             }
+            divisor += 1;
         }
+        dispatchData.stage_1.lws[0] *= fsv;
         dispatchData.stage_1.gws[0] = dispatchData.stage_1.lws[0];
-        dispatchData.stage_1.gws[1] = dispatchData.stage_1.lws[1];
 
         dispatchData.stage_2.gws[0] = input.Feature().v;
         dispatchData.stage_2.gws[1] = input.Batch().v;
@@ -83,7 +62,7 @@ GroupNormQuantizeKernelBase::MultiDispatchData GroupNormQuantizeKernelBfyx::SetD
         dispatchData.stage_2.lws[1] = 1;
         dispatchData.stage_2.lws[2] = 1;
 
-        size_t divisor = 2;
+        divisor = 2;
         while (dispatchData.stage_2.lws[0] > params.engineInfo.maxWorkGroupSize) {
             if ((input.Feature().v / params.num_groups) % divisor == 0) {
                 dispatchData.stage_2.lws[0] = (input.Feature().v / params.num_groups) / divisor;
@@ -99,21 +78,23 @@ GroupNormQuantizeKernelBase::MultiDispatchData GroupNormQuantizeKernelBfyx::SetD
         dispatchData.stage_max.lws[1] = 1;
         dispatchData.stage_max.lws[2] = 1;
 
-        dispatchData.stage_final.gws[0] = input.X().v * input.Y().v * input.Z().v;
-        dispatchData.stage_final.gws[1] = input.Feature().v * input.Batch().v;
+        dispatchData.stage_final.gws[0] = input.X().v * input.Y().v;
+        dispatchData.stage_final.gws[1] = CeilDiv(input.Feature().v, fsv) * input.Batch().v;
         dispatchData.stage_final.gws[2] = 1;
 
-        dispatchData.stage_final.lws[0] = input.X().v * input.Y().v * input.Z().v;
-        dispatchData.stage_final.lws[1] = input.Feature().v * input.Batch().v;
+        dispatchData.stage_final.lws[0] = input.X().v * input.Y().v;
+        dispatchData.stage_final.lws[1] = CeilDiv(input.Feature().v, fsv) * input.Batch().v;
         dispatchData.stage_final.lws[2] = 1;
 
-        divisor = 2;
-        while (dispatchData.stage_final.lws[0] > params.engineInfo.maxWorkGroupSize) {
+        divisor = 1;
+        while (dispatchData.stage_final.lws[0] > (params.engineInfo.maxWorkGroupSize / fsv)) {
             if (dispatchData.stage_final.gws[0] % divisor == 0) {
                 dispatchData.stage_final.lws[0] = dispatchData.stage_final.gws[0] / divisor;
             }
             divisor += 1;
         }
+        dispatchData.stage_final.lws[0] *= fsv;
+        dispatchData.stage_final.gws[0] *= fsv;
 
         divisor = 2;
         while ((dispatchData.stage_final.lws[0] * dispatchData.stage_final.lws[1]) > params.engineInfo.maxWorkGroupSize) {
@@ -127,23 +108,26 @@ GroupNormQuantizeKernelBase::MultiDispatchData GroupNormQuantizeKernelBfyx::SetD
     return dispatchData;
 }
 
-JitConstants GroupNormQuantizeKernelBfyx::GetJitConstants(const group_norm_quantize_params &params,
-                                                           GroupNormQuantizeKernelBase::DispatchData dispatchData) const {
+JitConstants GroupNormQuantizeKernel_b_fs_yx_fsv16::GetJitConstants(const group_norm_quantize_params &params,
+                                                              GroupNormQuantizeKernelBase::DispatchData dispatchData) const {
     auto jit = GroupNormQuantizeKernelBase::GetJitConstants(params);
+
+    jit.AddConstants({
+        MakeJitConstant("SIMD", simd),
+        MakeJitConstant("FSV", fsv),
+    });
 
     if (params.has_dynamic_tensors()) {
         jit.AddConstants({
             MakeJitConstant("GWS0", "get_global_size(0)"),
             MakeJitConstant("LWS0", "get_local_size(0)"),
-            MakeJitConstant("LWS1", "get_local_size(1)"),
-            MakeJitConstant("LWS2", "get_local_size(2)"),
+            MakeJitConstant("SLM_SIZE", params.engineInfo.maxWorkGroupSize),
         });
     } else {
         jit.AddConstants({
             MakeJitConstant("GWS0", dispatchData.gws[0]),
             MakeJitConstant("LWS0", dispatchData.lws[0]),
-            MakeJitConstant("LWS1", dispatchData.lws[1]),
-            MakeJitConstant("LWS2", dispatchData.lws[2]),
+            MakeJitConstant("SLM_SIZE", dispatchData.lws[0]),
         });
     }
     auto activation_dt = GetActivationType(params);
@@ -152,12 +136,10 @@ JitConstants GroupNormQuantizeKernelBfyx::GetJitConstants(const group_norm_quant
 
     if (!params.fused_ops.empty()) {
         std::vector<std::string> idx_order;
-        if (params.inputs[0].GetDims().size() == 5) {
-            idx_order = { "(b)", "(f)", "(z)", "(y)", "(x)" };
-        } else if (params.inputs[0].GetDims().size() <= 4) {
+        if (params.inputs[0].GetDims().size() <= 4) {
             idx_order = { "(b)", "(f)", "(y)", "(x)" };
         } else {
-            OPENVINO_THROW("group_norm_quantize_bfyx doesn't support 5D or higher dims.");
+            OPENVINO_THROW("group_normalization_b_fs_yx_fsv16 doesn't support 5D or higher dims.");
         }
         auto conf = FusedOpsConfiguration("", idx_order, "normalized", activation_dt, 1);
         jit.Merge(MakeFusedOpsJitConstants(params, { conf }));
@@ -166,7 +148,7 @@ JitConstants GroupNormQuantizeKernelBfyx::GetJitConstants(const group_norm_quant
     return jit;
 }
 
-void GroupNormQuantizeKernelBfyx::GetUpdateDispatchDataFunc(KernelData& kd) const {
+void GroupNormQuantizeKernel_b_fs_yx_fsv16::GetUpdateDispatchDataFunc(KernelData& kd) const {
     kd.update_dispatch_data_func = [this](const Params& params, KernelData& kd) {
         const auto& prim_params = static_cast<const group_norm_quantize_params&>(params);
         auto dispatchData = SetDefault(prim_params);
@@ -196,13 +178,35 @@ void GroupNormQuantizeKernelBfyx::GetUpdateDispatchDataFunc(KernelData& kd) cons
         kd.kernels[5].skip_execution = KernelData::SkipKernelExecution(prim_params, 5);
 
         kd.internalBufferSizes.clear();
-        kd.internalBufferSizes.push_back(prim_params.outputs[0].Batch().v * prim_params.outputs[0].Feature().v * 4);
-        kd.internalBufferSizes.push_back(prim_params.outputs[0].Batch().v * prim_params.outputs[0].Feature().v * 4);
-        kd.internalBufferSizes.push_back(prim_params.outputs[0].Batch().v * prim_params.outputs[0].Feature().v * 4);
+        kd.internalBufferSizes.push_back(prim_params.outputs[0].Batch().v * Align(prim_params.outputs[0].Feature().v, fsv) * 4);
+        kd.internalBufferSizes.push_back(prim_params.outputs[0].Batch().v * Align(prim_params.outputs[0].Feature().v, fsv) * 4);
+        kd.internalBufferSizes.push_back(prim_params.outputs[0].Batch().v * Align(prim_params.outputs[0].Feature().v, fsv) * 4);
     };
 }
 
-KernelsData GroupNormQuantizeKernelBfyx::GetKernelsData(const Params &params) const {
+bool GroupNormQuantizeKernel_b_fs_yx_fsv16::Validate(const Params& params) const {
+    if (!Parent::Validate(params))
+        return false;
+
+    const group_norm_quantize_params& prim_params = static_cast<const group_norm_quantize_params&>(params);
+
+    if (prim_params.has_dynamic_tensors())
+        return true;
+
+    // no support for spatial paddings
+    if (prim_params.inputs[0].X().pad.Total() > 0 || prim_params.inputs[0].Y().pad.Total() > 0) {
+        return false;
+    }
+
+    // feature paddings should be multiples of fsv.
+    if (prim_params.inputs[0].Feature().pad.before % fsv != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+KernelsData GroupNormQuantizeKernel_b_fs_yx_fsv16::GetKernelsData(const Params &params) const {
     assert(params.GetType() == KernelType::GROUP_NORM_QUANTIZE);
 
     if (!Validate(params))
@@ -366,7 +370,7 @@ KernelsData GroupNormQuantizeKernelBfyx::GetKernelsData(const Params &params) co
     return {kd};
 }
 
-KernelsPriority GroupNormQuantizeKernelBfyx::GetKernelsPriority(const Params& /*params*/) const {
-    return FORCE_PRIORITY_7;
+KernelsPriority GroupNormQuantizeKernel_b_fs_yx_fsv16::GetKernelsPriority(const Params& /*params*/) const {
+    return FORCE_PRIORITY_4;
 }
 } // namespace kernel_selector
