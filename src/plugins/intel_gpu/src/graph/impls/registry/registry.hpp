@@ -160,6 +160,7 @@ REGISTER_DEFAULT_IMPLS(data, COMMON_S, COMMON_D);
 REGISTER_DEFAULT_IMPLS(depth_to_space, OCL_S);
 REGISTER_DEFAULT_IMPLS(dft, OCL_S);
 REGISTER_DEFAULT_IMPLS(dynamic_quantize, OCL_S, OCL_D);
+REGISTER_DEFAULT_IMPLS(dynamic_scale, OCL_S, OCL_D);
 REGISTER_DEFAULT_IMPLS(experimental_detectron_detection_output, OCL_S);
 REGISTER_DEFAULT_IMPLS(experimental_detectron_generate_proposals_single_image, OCL_S);
 REGISTER_DEFAULT_IMPLS(experimental_detectron_prior_grid_generator, OCL_S);

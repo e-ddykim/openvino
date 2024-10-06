@@ -75,6 +75,7 @@
 #include "plugin/transformations/group_norm_composition.hpp"
 #include "plugin/transformations/group_norm_quantize_fusion.hpp"
 #include "plugin/transformations/dynamic_quantize_fully_connected.hpp"
+#include "plugin/transformations/dynamic_scale_convolution.hpp"
 #include "transformations/common_optimizations/nop_elimination.hpp"
 #include "transformations/common_optimizations/rms_fusion.hpp"
 #include "transformations/common_optimizations/broadcast_elementwise_fusion.hpp"
@@ -853,7 +854,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
         manager.register_pass<ov::intel_gpu::SwiGLUFusion>();
         manager.register_pass<ov::intel_gpu::IndirectKVCache>();
-        manager.register_pass<ov::intel_gpu::GroupNormQuantizeFusion>();
+        // manager.register_pass<ov::intel_gpu::GroupNormQuantizeFusion>();
+        manager.register_pass<ov::intel_gpu::DynamicScaleConvolution>(ov::element::f32);
         manager.register_pass<ov::intel_gpu::ConvertConvolutionToInternal>();
 
         // This pass should be done after asymmetric quantization matching as it can move zp subtraction upper in the graph

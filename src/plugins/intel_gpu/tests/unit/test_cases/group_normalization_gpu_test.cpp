@@ -7,10 +7,12 @@
 #include "intel_gpu/primitives/input_layout.hpp"
 #include "intel_gpu/primitives/group_normalization.hpp"
 #include "intel_gpu/primitives/group_norm_quantize.hpp"
+#include "intel_gpu/primitives/dynamic_scale.hpp"
 #include "intel_gpu/primitives/activation.hpp"
 #include "intel_gpu/primitives/eltwise.hpp"
 #include "openvino/reference/group_normalization.hpp"
 #include "openvino/reference/swish.hpp"
+#include "openvino/reference/multiply.hpp"
 #include "intel_gpu/runtime/compilation_context.hpp"
 
 
@@ -250,10 +252,63 @@ public:
             ASSERT_NEAR(output_gpu_mem[i], reference_output[i], 0.001);
         }
     }
+
+    void test_dynamic_scale(bool is_caching_test) {
+        std::vector<std::int32_t> input_shape = {3, 64, 32, 64};
+        std::vector<std::size_t> data_shape_;
+        std::copy(std::begin(input_shape), std::end(input_shape), std::back_inserter(data_shape_));
+        format format_ = format::b_fs_yx_fsv16;
+        // format format_ = format::bfyx;
+        const primitive_id data_primitive_ = "data";
+
+        tests::random_generator rg{"DynamicScaleGPUTest"};
+        std::vector<float> data_ = rg.generate_random_1d<float>(ov::shape_size(input_shape), -73, 131, 97);
+        const auto planar_format = format::dimension(format_) == 4 ? format::bfyx : format::bfzyx;
+
+        topology tp;
+        auto &engine = get_test_engine();
+        layout data_layout_ = layout{data_types::f32, planar_format, tensor{input_shape}};
+
+        primitive_id reordered_data_primitive = data_primitive_ + "_reordered";
+        tp.add(input_layout{data_primitive_, data_layout_});
+        tp.add(reorder{reordered_data_primitive, data_primitive_, format_, data_types::f32});
+
+        std::vector<optional_data_type> hoho = {optional_data_type(data_types::f16), optional_data_type(data_types::f32)};
+
+        auto s = dynamic_scale("dynamic_scale_output",
+                               input_info(reordered_data_primitive),
+                               hoho);
+
+        tp.add(s);
+        tp.add(reorder{"output_quantized", input_info("dynamic_scale_output", 0), planar_format, data_types::f32});
+        tp.add(reorder{"output_scale", input_info("dynamic_scale_output", 1), planar_format, data_types::f32});
+        tp.add(eltwise{"output", input_info("output_quantized"), input_info("output_scale"), eltwise_mode::prod});
+
+        ExecutionConfig cfg = get_test_default_config(engine);
+        cfg.set_property(ov::intel_gpu::optimize_data(true));
+
+        network::ptr network_ = std::make_shared<cldnn::network>(engine, tp, cfg);
+
+        auto data_gpu_mem = engine.allocate_memory(data_layout_);
+        set_values(data_gpu_mem, data_);
+        network_->set_input_data(data_primitive_, data_gpu_mem);
+        auto outputs = network_->execute();
+        auto output = outputs.at("output").get_memory();
+        cldnn::mem_lock<float> output_gpu_mem(output, get_test_stream());
+
+        ASSERT_EQ(output_gpu_mem.size(), data_.size());
+        for (std::size_t i = 0; i < data_.size(); i++) {
+            ASSERT_NEAR(output_gpu_mem[i], data_[i], 0.1);
+        }
+    }
 };
 
 TEST_F(group_norm_quantize_gpu_tests, basic) {
     this->test_basic(false);
+}
+
+TEST_F(group_norm_quantize_gpu_tests, dynamic_scale) {
+    this->test_dynamic_scale(false);
 }
 
 } // anonymous namespace

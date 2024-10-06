@@ -3,7 +3,7 @@
 //
 #include "primitive_base.hpp"
 #include "group_norm_quantize_inst.h"
-#include "group_norm_quantize/group_norm_quantize_kernel_bfyx_opt.h"
+#include "group_norm_quantize/group_norm_quantize_kernel_base.h"
 #include "group_norm_quantize/group_norm_quantize_kernel_selector.h"
 
 namespace cldnn {
