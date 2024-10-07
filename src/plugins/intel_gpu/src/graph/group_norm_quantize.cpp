@@ -36,8 +36,8 @@ std::vector<layout> group_norm_quantize_inst::calc_output_layouts(group_norm_qua
         per_tensor_shape[i] = 1;
     }
 
-    return {layout(output_type, input_node_layout.format, input_node_layout.get_tensor()),
-            layout(per_tensor_shape, scale_type, input_node_layout.format)};
+    return {layout(input_node_layout.get<ShapeType>(), output_type, input_node_layout.format),
+            layout(per_tensor_shape, scale_type, format::get_default_format(input_node_layout.get_rank()))};
 }
 
 std::string group_norm_quantize_inst::to_string(group_norm_quantize_node const& node) {

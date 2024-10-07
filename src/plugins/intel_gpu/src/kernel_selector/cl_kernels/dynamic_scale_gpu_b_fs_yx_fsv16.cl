@@ -78,8 +78,8 @@ KERNEL(calc_max_per_batch)(
 
         if (get_global_id(0) == 0) {
             const uint b = get_global_id(1);
-            output_scale[b * FSV] = TO_INPUT0_TYPE(max / 1.f);
-            printf("[%u] internal_max: %f, %f\n", b, max, output_scale[b * FSV]);
+            output_scale[b] = TO_INPUT0_TYPE(max / 1.f);
+            printf("[%u] internal_max: %f, %f\n", b, max, output_scale[b]);
         }
     }
 }
@@ -100,7 +100,7 @@ KERNEL(dynamic_scale_b_fs_yx_fsv16)(
     const uint output_index = OUTPUT_GET_INDEX(b, f, y, x);
 
     if (f < OUTPUT_FEATURE_NUM) {
-        INPUT0_TYPE res = input[input_index] / output_scale[b * FSV];
+        INPUT0_TYPE res = input[input_index] / output_scale[b];
         output[output_index] = TO_OUTPUT_TYPE(res);
     } else {
         output[output_index] = OUTPUT_VAL_ZERO;

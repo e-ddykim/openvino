@@ -53,16 +53,16 @@ DynamicScaleConvolution::DynamicScaleConvolution(ov::element::Type infer_precisi
         ov::replace_node(conv_weight, conv_weight_convert);
 
         auto dynamic_scale = std::make_shared<op::DynamicScale>(data, output_type);
-        data.get_node_shared_ptr()->output(0).replace(dynamic_scale->output(0));
-        dynamic_scale->add_node_control_dependents(data.get_node_shared_ptr());
-        dynamic_scale->add_node_control_dependencies(data.get_node_shared_ptr());
-        data.get_node_shared_ptr()->clear_control_dependents();
+        conv->input(0).replace_source_output(dynamic_scale->output(0));
+        // dynamic_scale->add_node_control_dependents(data.get_node_shared_ptr());
+        // dynamic_scale->add_node_control_dependencies(data.get_node_shared_ptr());
+        // data.get_node_shared_ptr()->clear_control_dependents();
         
-        auto scale_mul = std::make_shared<ov::op::v1::Multiply>(dynamic_scale->output(1),
+        auto scale_mul = std::make_shared<ov::op::v1::Multiply>(conv->output(0),
                                                                 dynamic_scale->output(1));
 
         ov::replace_node(conv, scale_mul);
-        scale_mul->input(0).replace_source_output(conv->output(0));
+        // scale_mul->input(0).replace_source_output(conv->output(0));
  
         return true;
     };

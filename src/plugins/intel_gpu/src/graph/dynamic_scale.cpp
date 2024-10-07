@@ -37,7 +37,7 @@ std::vector<layout> dynamic_scale_inst::calc_output_layouts(dynamic_scale_node c
     }
 
     return {layout(input_node_layout.get<ShapeType>(), output_type, input_node_layout.format),
-            layout(per_tensor_shape, scale_type, input_node_layout.format)};
+            layout(per_tensor_shape, scale_type, format::get_default_format(input_node_layout.get_rank()))};
 }
 
 std::string dynamic_scale_inst::to_string(dynamic_scale_node const& node) {
