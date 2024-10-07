@@ -280,9 +280,9 @@ public:
                                hoho);
 
         tp.add(s);
-        tp.add(reorder{"output_quantized", input_info("dynamic_scale_output", 0), planar_format, data_types::f32});
-        tp.add(reorder{"output_scale", input_info("dynamic_scale_output", 1), planar_format, data_types::f32});
-        tp.add(eltwise{"output", input_info("output_quantized"), input_info("output_scale"), eltwise_mode::prod});
+        tp.add(reorder{"quantized_data", input_info("dynamic_scale_output", 0), format_, data_types::f32});
+        tp.add(eltwise{"recovered_data", input_info("quantized_data"), input_info("dynamic_scale_output", 1), eltwise_mode::prod});
+        tp.add(reorder{"output", input_info("recovered_data"), planar_format, data_types::f32});
 
         ExecutionConfig cfg = get_test_default_config(engine);
         cfg.set_property(ov::intel_gpu::optimize_data(true));

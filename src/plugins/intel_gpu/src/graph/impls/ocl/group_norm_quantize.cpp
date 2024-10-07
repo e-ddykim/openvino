@@ -56,8 +56,8 @@ namespace detail {
 attach_group_norm_quantize_impl::attach_group_norm_quantize_impl() {
     auto types = {data_types::f16, data_types::f32};
     auto formats = {
-            // format::bfyx,
-            // format::bfzyx,
+            format::bfyx,
+            format::bfzyx,
             format::b_fs_yx_fsv16,
     };
 
@@ -67,7 +67,7 @@ attach_group_norm_quantize_impl::attach_group_norm_quantize_impl() {
                                      formats);
 
     const std::vector<format::type> dyn_formats {
-        // format::bfyx,
+        format::bfyx,
         format::b_fs_yx_fsv16,
     };
 
