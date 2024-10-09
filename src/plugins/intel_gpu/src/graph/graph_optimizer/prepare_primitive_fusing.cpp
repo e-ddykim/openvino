@@ -935,8 +935,8 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
             auto parent2 = parents[1];
 
             if (parent1.first->get_output_layout().is_static() && parent2.first->get_output_layout().is_static()) {
-                auto p1_raw_size = parent1.first->get_output_layout().get_tensor().sizes();
-                auto p2_raw_size = parent2.first->get_output_layout().get_tensor().sizes();
+                auto p1_raw_size = parent1.first->get_output_layout(true, parent1.second).get_tensor().sizes();
+                auto p2_raw_size = parent2.first->get_output_layout(true, parent2.second).get_tensor().sizes();
                 for (unsigned k = 0; k < p1_raw_size.size(); k++) {
                     if (p1_raw_size[k] < p2_raw_size[k]) {
                         if (p1_raw_size[k] != 1)
@@ -997,8 +997,8 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                 if (can_fuse_parents[peer_idx]) {
                     auto p1_pnum = p.get_processing_order().get_processing_number(parents[fused_idx].first);
                     auto p2_pnum = p.get_processing_order().get_processing_number(parents[peer_idx].first);
-                    auto p1_dt = parents[fused_idx].first->get_output_layout().data_type;
-                    auto p2_dt = parents[peer_idx].first->get_output_layout().data_type;
+                    auto p1_dt = parents[fused_idx].first->get_output_layout(true, parents[fused_idx].second).data_type;
+                    auto p2_dt = parents[peer_idx].first->get_output_layout(true, parents[peer_idx].second).data_type;
                     // Notice:
                     //     - If current node has two parent nodes and one of the parent nodes is what has been fused with some nodes,
                     //       and which is not the last one of the fused primitives, the current node should be fused to that node.
@@ -1048,7 +1048,7 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
             auto fused_node = parents[fused_idx].first;
             auto peer_node = parents[peer_idx].first;
             if (lo.get_optimization_attributes().use_onednn_impls && lo.is_primitive_implemented_for_onednn(*fused_node)) {
-                auto eltw_in_size = peer_node->get_output_layout();
+                auto eltw_in_size = peer_node->get_output_layout(true, parents[peer_idx].second);
                 if (eltw_in_size.is_dynamic()
                     // this whitelist condition is temporarily and to be relaxed soon.
                     && !fused_node->is_type<fully_connected>())
@@ -1137,7 +1137,7 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
             } else {
                 merge_allowed = fused_node->get_users().size() == 1;
                 for (auto& parent : fused_node->get_dependencies())
-                    if (parent.first->id() == peer_node->id())
+                    if (parent.first->id() == peer_node->id() && parent.second == parents[peer_idx].second)
                         merge_allowed = false;
             }
 
