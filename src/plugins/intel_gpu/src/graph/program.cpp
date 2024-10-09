@@ -1187,7 +1187,7 @@ void program::fuse_nodes(program_node &fused_node,
             }
         }
 
-        auto port_idx = fused_node.get_port_from_deps(dep.id());
+        auto port_idx = peer_node.get_port_from_deps(dep.id());
         fused_node.dependencies.push_back({&dep, port_idx});
         local_desc.deps.emplace_back(dep.id(), deps_idx++);
         dep.users.push_back(&fused_node);

@@ -1464,7 +1464,8 @@ void program_node::create_onednn_primitive_attributes(
         if (impl_params != nullptr) {
             return impl_params->get_input_layout(idx);
         } else {
-            return get_dependency(idx).get_output_layout();
+            auto dep_output = get_dependency_with_port(idx);
+            return dep_output.first->get_output_layout(true, dep_output.second);
         }
     };
 
