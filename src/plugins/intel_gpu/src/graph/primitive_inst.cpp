@@ -2344,7 +2344,7 @@ bool primitive_inst::is_valid_fusion() const {
         OPENVINO_ASSERT(outer_dep_idx < 0 || static_cast<int32_t>(_deps.size()) > outer_dep_idx, "[GPU] Invalid fused dependency idx");
         const auto& outer_dep = _deps[outer_dep_idx];
 
-        const auto& outer_dep_pshape = outer_dep.first->_impl_params->get_output_layout().get_partial_shape();
+        const auto& outer_dep_pshape = outer_dep.first->_impl_params->get_output_layout(outer_dep.second).get_partial_shape();
         auto merged_shape = out_pshape;
         bool can_broadcast = true;
         if (fd.is_type<eltwise>())
@@ -2359,7 +2359,7 @@ bool primitive_inst::is_valid_fusion() const {
         // correctly and we need to do it manually
         if (_node->is_type<gemm>() && _node->get_preferred_impl_type() == impl_types::onednn) {
             const auto& gemm_layout = _impl_params->get_output_layout();
-            const auto& data_layout = outer_dep.first->_impl_params->get_output_layout();
+            const auto& data_layout = outer_dep.first->_impl_params->get_output_layout(outer_dep.second);
             auto gemm_dims = onednn::convert_gemm_tensor(gemm_layout.get_tensor(),
                                                          cldnn::format::dimension(gemm_layout.format),
                                                          false);
@@ -2372,7 +2372,7 @@ bool primitive_inst::is_valid_fusion() const {
                 return false;
         } else if (_node->is_type<fully_connected>() && _node->get_preferred_impl_type() == impl_types::onednn) {
             const auto& fc_layout = _impl_params->get_output_layout();
-            const auto& data_layout = outer_dep.first->_impl_params->get_output_layout();
+            const auto& data_layout = outer_dep.first->_impl_params->get_output_layout(outer_dep.second);
 
             const auto fc_dims = fc_layout.get_dims();
             const auto data_dims = data_layout.get_dims();
