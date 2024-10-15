@@ -132,6 +132,13 @@ static constexpr Property<bool> enable_sdpa_optimization{"GPU_ENABLE_SDPA_OPTIMI
  * @ingroup ov_runtime_ocl_gpu_prop_cpp_api
  */
 static constexpr Property<bool> enable_kernels_reuse{"GPU_ENABLE_KERNELS_REUSE"};
+
+/**
+ * @brief Turning on this property allows some layers to be run at fp16 instead of fp32 precision,
+ * resuling in better performance. However, as a drawback, accuracy might be degraded due to low precision.
+ * @ingroup ov_runtime_ocl_gpu_prop_cpp_api
+ */
+static constexpr Property<bool> enable_dynamic_scale{"GPU_ENABLE_DYNAMIC_SCALE"};
 }  // namespace hint
 
 /**
