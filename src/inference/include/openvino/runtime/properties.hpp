@@ -1345,4 +1345,10 @@ static constexpr Property<Affinity> affinity{"AFFINITY"};
  */
 static constexpr Property<std::vector<std::string>, PropertyMutability::RO> execution_devices{"EXECUTION_DEVICES"};
 
+/**
+ * @brief This property allows static scaling that scales down some layers' input tensors and changes their runtime precisions to lower ones.
+ * @ingroup ov_runtime_cpp_prop_api
+ */
+static constexpr Property<bool, PropertyMutability::RW> enable_static_scaling{"ENABLE_STATIC_SCALING"};
+
 }  // namespace ov
