@@ -92,6 +92,7 @@
 #include "transformations/common_optimizations/lstm_cell_fusion.hpp"
 #include "transformations/common_optimizations/move_eltwise_up_data_movement.hpp"
 #include "transformations/common_optimizations/mvn_fusion.hpp"
+#include "transformations/common_optimizations/static_scaling.hpp"
 #include "transformations/common_optimizations/softmax_fusion.hpp"
 #include "transformations/common_optimizations/glu_fusion.hpp"
 #include "transformations/common_optimizations/transpose_sinking.hpp"
@@ -930,6 +931,9 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         }
         if (!disable_horizontal_fc_fusion)
             manager.register_pass<ov::pass::ConstantFolding>();
+
+        if (config.get_property(ov::enable_static_scaling))
+            manager.register_pass<ov::pass::StaticScaling>();
 
         manager.register_pass<ov::pass::ConvertGatherToGatherCompressed>();
         auto pass_config = manager.get_pass_config();
