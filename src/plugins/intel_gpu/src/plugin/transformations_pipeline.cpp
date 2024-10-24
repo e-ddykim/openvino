@@ -811,6 +811,15 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         };
         manager.register_pass<ov::pass::MoveEltwiseUpThroughDataMovScalar>(allowed_data_movement_ops);
 
+        if (config.get_property(ov::enable_static_scaling)) {
+            float scale_factor = func->get_rt_info().count("scale_factor") ? func->get_rt_info<std::float_t>("scale_factor") : 0.f;
+            // manager.register_pass<ov::pass::StaticScaling>(scale_factor);
+            // manager.register_pass<ov::pass::StaticScalingInput>(scale_factor);
+            // manager.register_pass<ov::pass::StaticScalingOutput>(scale_factor);
+            // manager.register_pass<ov::pass::StaticScalingAdd>(scale_factor);
+            manager.register_pass<ov::pass::StaticScalingModel>(scale_factor);
+        }
+
         manager.register_pass<ov::intel_gpu::ClampFP16Output>();
         manager.register_pass<ov::intel_gpu::ConvertMatMulToFullyConnected>();
         manager.register_pass<ov::intel_gpu::MoveFCReshapeToWeights>();
@@ -833,11 +842,6 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         }
         if (!disable_horizontal_fc_fusion)
             manager.register_pass<ov::pass::ConstantFolding>();
-
-        if (config.get_property(ov::enable_static_scaling)) {
-            float scale_factor = func->get_rt_info().count("scale_factor") ? func->get_rt_info<std::float_t>("scale_factor") : 0.f;
-            manager.register_pass<ov::pass::StaticScaling>();
-        }
 
         manager.register_pass<ov::pass::ConvertGatherToGatherCompressed>();
         auto pass_config = manager.get_pass_config();
