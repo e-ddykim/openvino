@@ -12,7 +12,7 @@ namespace intel_gpu {
 class DynamicScaleConvolution : public ov::pass::MatcherPass {
 public:
     OPENVINO_RTTI("DynamicScaleConvolution", "0");
-    DynamicScaleConvolution(ov::element::Type infer_precision);
+    DynamicScaleConvolution();
 };
 
 }   // namespace intel_gpu

@@ -3,7 +3,7 @@
 //
 
 #pragma once
-
+#define ENABLE_ONEDNN_FOR_GPU 1
 #include "intel_gpu/graph/serialization/binary_buffer.hpp"
 #include "intel_gpu/graph/serialization/layout_serializer.hpp"
 #include "intel_gpu/graph/serialization/set_serializer.hpp"
