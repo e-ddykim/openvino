@@ -227,10 +227,14 @@ static bool is_decompression_multiply(const std::shared_ptr<const ov::Node> node
 }
 
 static bool has_quantized_consumer(const std::shared_ptr<const ov::Node>& node) {
-    const auto& target_nodes = node->get_output_target_inputs(0);
-    if (target_nodes.size() == 1) {
+    auto target_nodes = node->get_output_target_inputs(0);
+    while (target_nodes.size() == 1) {
         const auto target_node = target_nodes.begin()->get_node()->shared_from_this();
-        return ov::intel_gpu::has_quantized_input(target_node);
+        if (ov::intel_gpu::has_quantized_input(target_node)) {
+            return true;
+        } else {
+            target_nodes = target_node->get_output_target_inputs(0);
+        }
     }
     return false;
 }

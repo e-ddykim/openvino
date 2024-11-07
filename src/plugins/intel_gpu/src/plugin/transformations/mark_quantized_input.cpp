@@ -3,9 +3,10 @@
 //
 #include "mark_quantized_input.hpp"
 #include "openvino/core/rt_info.hpp"
-#include "openvino/op/fake_quantize.hpp"
-#include "openvino/op/matmul.hpp"
 #include "openvino/op/convolution.hpp"
+#include "openvino/op/fake_quantize.hpp"
+#include "openvino/op/group_conv.hpp"
+#include "openvino/op/matmul.hpp"
 #include "openvino/pass/pattern/op/or.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 #include "transformations/utils/utils.hpp"
@@ -27,6 +28,7 @@ bool check_quantized(const std::shared_ptr<Node>& node, int depth) {
     if (depth > 10)
         return false;
     if (ov::is_type<ov::op::v0::MatMul>(node) ||
+        ov::is_type<ov::op::v1::GroupConvolution>(node) ||
         ov::is_type<ov::op::v1::Convolution>(node)) {
         mark_as_quantized_input(node);
         return true;
@@ -46,8 +48,6 @@ MarkQuantizedInput::MarkQuantizedInput() {
         const auto& pattern_map = m.get_pattern_value_map();
         OPENVINO_ASSERT(pattern_map.count(fakequantize_m));
         auto fakequantize = std::dynamic_pointer_cast<ov::op::v0::FakeQuantize>(pattern_map.at(fakequantize_m).get_node_shared_ptr());
-        if (fakequantize->get_friendly_name().compare("Transpose_14096") == 0)
-            std::cout << "!" << std::endl;
         if (transformation_callback(fakequantize))
             return false;
         return check_quantized(fakequantize, 0);
