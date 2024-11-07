@@ -68,6 +68,7 @@
 #include "plugin/transformations/fc_convert_fusion.hpp"
 #include "plugin/transformations/fc_horizontal_fusion.hpp"
 #include "plugin/transformations/kv_cache_fusion.hpp"
+#include "plugin/transformations/mark_quantized_input.hpp"
 #include "plugin/transformations/move_fc_reshape_to_weights.hpp"
 #include "plugin/transformations/bcast_and_pad_zp_buffers.hpp"
 #include "plugin/transformations/print_model_statistics.hpp"
@@ -224,6 +225,15 @@ static bool is_decompression_multiply(const std::shared_ptr<const ov::Node> node
     }
     return are_converts_from_decompression(consumers);
 }
+
+static bool has_quantized_consumer(const std::shared_ptr<const ov::Node>& node) {
+    const auto& target_nodes = node->get_output_target_inputs(0);
+    if (target_nodes.size() == 1) {
+        const auto target_node = target_nodes.begin()->get_node()->shared_from_this();
+        return ov::intel_gpu::has_quantized_input(target_node);
+    }
+    return false;
+}
 }  // namespace
 
 namespace cldnn {
@@ -255,6 +265,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         auto is_model_quantized = ov::pass::low_precision::LowPrecision::isFunctionQuantized(func);
         enableInt8 = config.get_property(ov::intel_gpu::enable_lp_transformations) && is_model_quantized;
         if (enableInt8) {
+            manager.register_pass<ov::intel_gpu::MarkQuantizedInput>();
+
             manager.register_pass<ov::pass::MarkDequantizationSubgraph>(
                 std::vector<ov::element::Type>{ ov::element::i8, ov::element::u8, ov::element::i4, ov::element::u4 });
         }
@@ -337,7 +349,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         // types are not supported by oneDNN)
         manager.register_pass<ov::pass::MarkDequantizationSubgraph>(supported_woq_types, !device_info.supports_immad);
         pass_config->set_callback<ov::pass::MarkDequantizationSubgraph>([&](const std::shared_ptr<const ov::Node> node) {
-            return !is_decompression_multiply(node);
+            return !is_decompression_multiply(node) && !has_quantized_consumer(node);
         });
 
         const bool keep_precision_sensitive_in_fp32_1 = true;
@@ -757,7 +769,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         });
 
         lptPassConfig->set_callback<AddTransformation>([](const_node_ptr& node) -> bool {
-            return ov::marked_as_bias(node);
+            return ov::marked_as_bias(node) && !ov::intel_gpu::has_quantized_input(node->get_input_source_output(0).get_node_shared_ptr());
         });
         lptPassConfig->set_callback<FoldConvertTransformation>([](const_node_ptr& node) -> bool {
             const auto& consumers = node->get_output_target_inputs(0);
@@ -769,12 +781,14 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         });
         lptPassConfig->set_callback<FuseConvertTransformation>([](const_node_ptr& node) -> bool {
             if (ov::is_type<ov::opset1::Multiply>(node)) {
-                return ov::is_type<ov::opset1::Multiply>(node) && is_decompression_multiply(node);
+                return is_decompression_multiply(node) && !has_quantized_consumer(node);
             } else if (ov::is_type<ov::opset1::Subtract>(node)) {
                 const auto& consumers = node->get_output_target_inputs(0);
                 if (consumers.size() == 1) {
                     const auto consumer = consumers.begin()->get_node()->shared_from_this();
-                    return ov::is_type<ov::opset1::Multiply>(consumer) && is_decompression_multiply(consumer);
+                    if (ov::is_type<ov::opset1::Multiply>(consumer) && is_decompression_multiply(consumer)) {
+                        return !has_quantized_consumer(consumer);
+                    }
                 }
             }
             return false;
