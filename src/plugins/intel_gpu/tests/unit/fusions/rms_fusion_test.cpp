@@ -78,7 +78,7 @@ TEST_P(rms_activation, basic) {
     create_topologies(
         input_layout("input", get_input_layout(p)),
         input_layout("gamma", get_gamma_layout(p)),
-        rms("rms", input_info("input"), input_info("gamma"), 1e-10f, get_input_layout(p).get_rank()),
+        rms("rms", input_info("input"), input_info("gamma"), 1e-10f, get_input_layout(p).get_partial_shape().size()),
         activation("act", input_info("rms"), activation_func::relu),
         reorder("reorder_bfyx", input_info("act"), format::bfyx, data_types::f32)
     );
