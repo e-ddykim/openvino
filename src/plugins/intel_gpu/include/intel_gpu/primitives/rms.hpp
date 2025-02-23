@@ -53,11 +53,13 @@ struct rms : public primitive_base<rms> {
     void save(BinaryOutputBuffer& ob) const override {
         primitive_base<rms>::save(ob);
         ob << epsilon;
+        ob << input_rank;
     }
 
     void load(BinaryInputBuffer& ib) override {
         primitive_base<rms>::load(ib);
         ib >> epsilon;
+        ib >> input_rank;
     }
 };
 }  // namespace cldnn
