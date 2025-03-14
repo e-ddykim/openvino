@@ -2734,7 +2734,7 @@ bool primitive_inst::is_valid_fusion() const {
 
             if (!(fc_dims[0] == 1 || fc_dims[1] == 1) &&
                 !(data_dims[0] == 1 && data_dims[1] == 1) &&
-                !((data_dims[0] == 1 || data_dims[1] == 1) && same_spatial(fc_layout, data_layout)) &&
+                !((data_dims[0] == 1 || data_dims[1] == fc_dims[1]) && same_spatial(fc_layout, data_layout)) &&
                 !(fc_layout.count() == data_layout.count())) {
                 return false;
             }
