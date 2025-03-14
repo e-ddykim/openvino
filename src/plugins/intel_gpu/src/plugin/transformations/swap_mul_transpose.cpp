@@ -118,6 +118,12 @@ VariadicSplitMulFusion::VariadicSplitMulFusion() {
                 break;
             }
 
+            if (target_node->get_input_element_type(0) != target_node->get_input_element_type(1) ||
+                target_node->get_input_element_type(0) != target_node->get_element_type()) {
+                can_be_merged = false;
+                break;
+            }
+
             for (auto& input : target_node->inputs()) {
                 if (input.get_source_output() != output) {
                     if (is_scalar_const(input.get_source_output())) {
