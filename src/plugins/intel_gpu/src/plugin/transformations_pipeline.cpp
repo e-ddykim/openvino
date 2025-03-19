@@ -1088,13 +1088,6 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             // Move up remained scalar-multiply layers
             manager.register_pass<ov::pass::EliminateEltwise>();
             manager.register_pass<ov::pass::activations_scaling::MulShareTransformation>();
-
-            const std::vector<DiscreteTypeInfo> allowed_data_movement_ops = {
-                ov::op::v1::Reshape::get_type_info_static(),
-                ov::op::v1::Transpose::get_type_info_static(),
-            };
-            manager.register_pass<ov::pass::MoveEltwiseUpThroughDataMovScalar>(allowed_data_movement_ops);
-            manager.register_pass<ov::pass::Validate>();
         }
 
         manager.run_passes(func);
@@ -1164,6 +1157,14 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         manager.register_pass<ov::intel_gpu::OptimizeSubsequentReshapes>();
 
         manager.register_pass<ov::intel_gpu::SinkReshape>();
+
+        const std::vector<DiscreteTypeInfo> allowed_data_movement_ops = {
+            ov::op::v1::Reshape::get_type_info_static(),
+            ov::op::v1::Transpose::get_type_info_static(),
+            ov::op::v1::StridedSlice::get_type_info_static(),
+        };
+        manager.register_pass<ov::pass::MoveEltwiseUpThroughDataMovScalar>(allowed_data_movement_ops);
+        manager.register_pass<ov::pass::Validate>();
 
         manager.register_pass<ov::intel_gpu::SwapMulTranspose>();
 
