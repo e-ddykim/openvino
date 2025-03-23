@@ -1170,6 +1170,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
         manager.register_pass<ov::intel_gpu::VariadicSplitMulFusion>();
 
+        manager.register_pass<ov::intel_gpu::hoho>();
+
         if (device_info.supports_immad) {
             bool asymmetric_dyn_quant = GPU_DEBUG_VALUE_OR(config.get_asym_dynamic_quantization(), false);
             auto dynamic_quantization_group_size = config.get_dynamic_quantization_group_size();

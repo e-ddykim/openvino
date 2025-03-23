@@ -15,5 +15,10 @@ public:
     SinkReshape();
 };
 
-}   // namespace intel_gpu
+class hoho: public ov::pass::MatcherPass {
+    public:
+        OPENVINO_MATCHER_PASS_RTTI("hoho");
+        hoho();
+    };
+    }   // namespace intel_gpu
 }   // namespace ov
