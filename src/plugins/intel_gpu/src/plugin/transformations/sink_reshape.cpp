@@ -10,6 +10,7 @@
 #include "openvino/pass/pattern/op/or.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 #include "transformations/utils/utils.hpp"
+#include "openvino/op/paged_attention.hpp"
 
 namespace ov {
 namespace intel_gpu {
@@ -159,6 +160,32 @@ SinkReshape::SinkReshape() {
         return true;
     };
     auto m = std::make_shared<ov::pass::pattern::Matcher>(transpose_m, "SinkReshapeIfNeeded");
+    this->register_matcher(m, callback);
+}
+
+
+hoho::hoho() {
+    using namespace ov::pass::pattern;
+    using ov::pass::pattern::op::Or;
+    using namespace ov::op;
+
+    auto pa_m = wrap_type<PagedAttentionExtension>();
+    auto multiply_m = wrap_type<v1::Multiply>({pa_m, any_input()});
+
+    ov::matcher_pass_callback callback = [OV_CAPTURE_CPY_AND_THIS](ov::pass::pattern::Matcher& m) {
+        const auto& pattern_map = m.get_pattern_value_map();
+        auto multiply = std::dynamic_pointer_cast<v1::Multiply>(pattern_map.at(multiply_m).get_node_shared_ptr());
+        if (!multiply || transformation_callback(multiply)) {
+            return false;
+        }
+
+        for (auto& target : multiply->get_output_target_inputs(0)) {
+            target.replace_source_output(multiply->get_input_source_output(0));
+        }
+
+        return true;
+    };
+    auto m = std::make_shared<ov::pass::pattern::Matcher>(multiply_m, "hoho");
     this->register_matcher(m, callback);
 }
 }  // namespace intel_gpu
