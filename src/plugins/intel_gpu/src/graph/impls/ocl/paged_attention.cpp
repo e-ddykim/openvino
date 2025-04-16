@@ -200,6 +200,7 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
     }
 
     kernel_arguments_data get_arguments(const paged_attention_inst& instance, size_t stage, size_t kernel_idx, bool is_mixed_mode) const {
+        bool is_the_last_stage = false;
         const auto desc = instance.get_node().as<paged_attention>().get_primitive();
 
         kernel_arguments_data args;
@@ -237,6 +238,7 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
             }
 
             args.outputs = { instance.output_memory_ptr(0) };
+            is_the_last_stage = true;
         } else if (stage == Stage::PA_SDPA) {
             if (kernel_idx == 0 || kernel_idx == 1 || kernel_idx == 2) {
                 // 2nd+ token calculation or mixed stage tokens calculation
@@ -262,6 +264,7 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
                 if (desc->has_alibi) {
                     args.inputs.push_back(instance.alibi_memory_ptr());
                 }
+                is_the_last_stage = true;
             } else if (kernel_idx == 3 || kernel_idx == 4) {
                 // Finalization kernel or mixed stage finalization kernel
                 args.inputs = { instance.past_lens_memory_ptr() };
@@ -276,6 +279,7 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
                     args.inputs.push_back(instance.rotation_deltas_memory_ptr());
                     args.inputs.push_back(instance.rotation_trig_lut_memory_ptr());
                 }
+                is_the_last_stage = true;
             } else if (kernel_idx == 5) {
                 // Output scores calculation kernel
                 args.inputs = { instance.past_lens_memory_ptr(),
@@ -286,6 +290,13 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
 
             if (kernel_idx == 5) {
                 args.outputs.push_back(instance.output_memory_ptr(1));
+            }
+        }
+
+        if (is_the_last_stage && instance.has_fused_primitives()) {
+            size_t count = instance.get_fused_mem_count();
+            for (size_t i = 0; i < count; i++) {
+                args.fused_op_inputs.push_back(instance.fused_memory(i));
             }
         }
 
@@ -484,6 +495,21 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
 
             if (use_micro_sdpa && stage == Stage::SDPA) {
                 args.intermediates.push_back(intermediate_memories.back());
+            }
+
+            if (args.fused_op_inputs.size() == 0) {
+                std::vector<size_t> fused_ops_args_idx;
+                auto& args = _kernels_data[stage].kernels[kd_idx].params.arguments;
+                for (size_t i = 0; i < args.size(); i++) {
+                    if (args[i].t == argument_desc::Types::INPUT_OF_FUSED_PRIMITIVE) {
+                        fused_ops_args_idx.push_back(i);
+                    }
+                }
+                while (fused_ops_args_idx.size() > 0) {
+                    size_t idx = fused_ops_args_idx.back();
+                    fused_ops_args_idx.pop_back();
+                    args.erase(args.begin() + idx);
+                }
             }
 
             GPU_DEBUG_TRACE_DETAIL << "Execute stage=" << stage << " kernel=" << kd_idx << " " << _kernels_data[stage].kernelName << " start_offset="

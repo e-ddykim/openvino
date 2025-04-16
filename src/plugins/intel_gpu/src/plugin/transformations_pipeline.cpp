@@ -1166,11 +1166,11 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         manager.register_pass<ov::pass::MoveEltwiseUpThroughDataMovScalar>(allowed_data_movement_ops);
         manager.register_pass<ov::pass::Validate>();
 
-        manager.register_pass<ov::intel_gpu::SwapMulTranspose>();
+        // manager.register_pass<ov::intel_gpu::SwapMulTranspose>();
 
         manager.register_pass<ov::intel_gpu::VariadicSplitMulFusion>();
 
-        manager.register_pass<ov::intel_gpu::hoho>();
+        // manager.register_pass<ov::intel_gpu::hoho>();
 
         if (device_info.supports_immad) {
             bool asymmetric_dyn_quant = GPU_DEBUG_VALUE_OR(config.get_asym_dynamic_quantization(), false);

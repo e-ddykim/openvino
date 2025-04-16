@@ -300,6 +300,12 @@ JitConstants PagedAttentionSDPAKernelOpt::GetJitConstants(const pa_sdpa_params& 
 
     jit.Merge(MakeTypeJitConstants(softmax_acc_dt, "SOFTMAX_ACCUMULATOR"));
 
+    if (!params.fused_ops.empty()) {
+        std::vector<std::string> idx_order = { "0", "0", "0", "0", "0" };
+        auto conf = FusedOpsConfiguration("", idx_order, "res", params.outputs[0].GetDType(), 1);
+        jit.Merge(MakeFusedOpsJitConstants(params, { conf }));
+    }
+
     return jit;
 }
 

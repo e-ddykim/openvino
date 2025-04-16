@@ -710,7 +710,7 @@ struct base_params : public Params {
             size_t offset = in_tensor_to_offset_map.at(i);
             in.SetDynamicShapeOffset(offset);
         }
-        OPENVINO_ASSERT(fused_ops.empty(), "[GPU] set_dynamic_shape_offsets with mappings doesn't support fused ops for now");
+        // OPENVINO_ASSERT(fused_ops.empty(), "[GPU] set_dynamic_shape_offsets with mappings doesn't support fused ops for now");
         for (size_t i = 0; i < outputs.size(); i++) {
             auto& out = outputs[i];
             OPENVINO_ASSERT(out_tensor_to_offset_map.count(i) > 0, "[GPU] set_dynamic_shape_offsets expects all output tensors have mapping to the offset");

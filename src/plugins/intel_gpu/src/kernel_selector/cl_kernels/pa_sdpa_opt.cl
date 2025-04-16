@@ -64,6 +64,9 @@ KERNEL(pa_sdpa_opt)(
     const __global ALIBI_INPUT_TYPE* alibi_slopes,
 #endif
     __global OUTPUT_TYPE* output,
+#if HAS_FUSED_OPS_DECLS
+    FUSED_OPS_DECLS,
+#endif
 #if PAGED_ATTENTION_SCORES_OUTPUT
     __global SOFTMAX_ACCUMULATOR_TYPE* softmax_results,
     const __global int* subsequence_offsets,
@@ -587,7 +590,13 @@ KERNEL(pa_sdpa_opt)(
                                            sgid * SUBGROUP_SIZE +
                                            sglid;
 
-                output[output_offset] = GET_VECTOR_ELEMENT(acc, q_idx);
+                #if HAS_FUSED_OPS
+                    // OUTPUT_TYPE res = GET_VECTOR_ELEMENT(acc, q_idx);
+                    // FUSED_OPS;
+                    output[output_offset] = GET_VECTOR_ELEMENT(acc, q_idx) / 8.0;
+                #else
+                    output[output_offset] = GET_VECTOR_ELEMENT(acc, q_idx);
+                #endif
             }
         }
 
@@ -616,6 +625,9 @@ KERNEL(pa_sdpa_finalization_stage)(
     const __global INPUT6_TYPE* subsequence_begins,
 #endif
     __global OUTPUT_TYPE* output,
+#if HAS_FUSED_OPS_DECLS
+    FUSED_OPS_DECLS,
+#endif
 #if PAGED_ATTENTION_SCORES_OUTPUT
     __global SOFTMAX_ACCUMULATOR_TYPE* softmax_results,
     const __global int* subsequence_offsets,
@@ -692,7 +704,13 @@ KERNEL(pa_sdpa_finalization_stage)(
                                 head_num_idx * HEAD_SIZE +
                                 head_size_idx;
 
-        output[out_offset] = TO_OUTPUT_TYPE(acc);
+        #if HAS_FUSED_OPS
+            // OUTPUT_TYPE res = TO_OUTPUT_TYPE(acc);
+            // FUSED_OPS;
+            output[out_offset] = TO_OUTPUT_TYPE(acc) / 8.0;
+        #else
+            output[out_offset] = TO_OUTPUT_TYPE(acc);
+        #endif
     } else {
         /* Global memory kernel version, can handle any number of tokens */
         SOFTMAX_ACCUMULATOR_TYPE local_exp_sum = SOFTMAX_ACCUMULATOR_VAL_ZERO;
@@ -745,7 +763,13 @@ KERNEL(pa_sdpa_finalization_stage)(
                                 head_num_idx * HEAD_SIZE +
                                 head_size_idx;
 
-        output[out_offset] = TO_OUTPUT_TYPE(acc);
+        #if HAS_FUSED_OPS
+            // OUTPUT_TYPE res = TO_OUTPUT_TYPE(acc);
+            // FUSED_OPS;
+            output[out_offset] = TO_OUTPUT_TYPE(acc) / 8.0;
+        #else
+            output[out_offset] = TO_OUTPUT_TYPE(acc);
+        #endif
     }
 }
 

@@ -39,6 +39,7 @@
 #include "cum_sum_inst.h"
 #include "embedding_bag_inst.h"
 #include "swiglu_inst.h"
+#include "paged_attention_inst.h"
 #include "extract_image_patches_inst.h"
 #include "reduce_inst.h"
 #include "group_normalization_inst.h"
@@ -629,6 +630,20 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
             return true;
         };
 
+        auto pa_supports_fusings = [](paged_attention_node& node) -> bool {
+            if (node.get_users().front()->is_type<eltwise>()) {
+                auto& eltw = node.get_users().front()->as<eltwise>();
+                if (eltw.get_dependency(1).is_type<data>()) {
+                    auto& eltw_const = eltw.get_dependency(1).as<data>();
+                    if (eltw_const.get_output_layout().count() == 1) {
+                        std::cout << "fusion! " << node.id() << std::endl;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
         auto reduce_supports_fusings = [&](reduce_node& node) -> bool {
             auto keep_dims = node.as<reduce>().get_primitive()->keep_dims;
 
@@ -960,6 +975,9 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                 !prim->stride.empty())
                 return;
 
+            if (node.id().compare("multiply:Multiply_120550") == 0)
+                std::cout << "!!" << std::endl;
+
             std::vector<std::pair<program_node*, int32_t>> parents = node.get_dependencies();
 
             std::vector<bool> can_fuse_parents = { false, false };
@@ -989,6 +1007,8 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                                       (parents[i].first->is_type<scatter_elements_update>()) ||
                                       (parents[i].first->is_type<pooling>()) ||
                                       (parents[i].first->is_type<swiglu>()) ||
+                                      (parents[i].first->is_type<paged_attention>() &&
+                                       pa_supports_fusings(parents[i].first->as<paged_attention>())) ||
                                       (parents[i].first->is_type<depth_to_space>() &&
                                        dts_supports_fusings(parents[i].first->as<depth_to_space>())) ||
                                       (parents[i].first->is_type<gather>()) ||
