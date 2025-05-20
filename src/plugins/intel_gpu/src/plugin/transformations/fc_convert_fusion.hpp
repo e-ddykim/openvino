@@ -14,4 +14,10 @@ public:
     FullyConnectedConvertFusion();
 };
 
+class GemmConvertFusion: public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("GemmConvertFusion");
+    GemmConvertFusion();
+};
+    
 }   // namespace ov::intel_gpu

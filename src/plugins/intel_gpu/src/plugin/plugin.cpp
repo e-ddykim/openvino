@@ -42,6 +42,7 @@
 #include "transformations/init_node_info.hpp"
 #include "transformations/rt_info/fused_names_attribute.hpp"
 #include "transformations/utils/utils.hpp"
+#include "openvino/pass/serialize.hpp"
 
 // Undef DEVICE_TYPE macro which can be defined somewhere in windows headers as DWORD and conflict with our metric
 #ifdef DEVICE_TYPE
@@ -139,6 +140,7 @@ std::shared_ptr<ov::Model> Plugin::clone_and_transform_model(const std::shared_p
     GPU_DEBUG_IF(!dump_path.empty()) {
         auto path_base = dump_path + "/" + cloned_model->get_name() + "_" +  "transformed_func";
         ov::pass::VisualizeTree(path_base + ".svg").run_on_model(cloned_model);
+        ov::pass::Serialize(path_base + ".xml", path_base + ".bin").run_on_model(cloned_model);
     }
     return cloned_model;
 }

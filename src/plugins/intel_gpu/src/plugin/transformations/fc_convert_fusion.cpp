@@ -4,6 +4,7 @@
 
 #include "fc_convert_fusion.hpp"
 
+#include "intel_gpu/op/gemm.hpp"
 #include "intel_gpu/op/fully_connected.hpp"
 #include "intel_gpu/op/fully_connected_compressed.hpp"
 
@@ -67,6 +68,43 @@ FullyConnectedConvertFusion::FullyConnectedConvertFusion() {
     };
 
     auto m = std::make_shared<ov::pass::pattern::Matcher>(convert, "FullyConnectedConvertFusion");
+    this->register_matcher(m, callback);
+}
+
+GemmConvertFusion::GemmConvertFusion() {
+    using namespace ov::pass::pattern;
+
+    auto input0_m = any_input();
+    auto input1_m = any_input();
+    auto gemm_m = wrap_type<op::Gemm>({input0_m, input1_m}, consumers_count(1));
+    auto convert_m = wrap_type<ov::op::v0::Convert>({gemm_m}, type_matches(element::f32));
+
+    ov::matcher_pass_callback callback = [=](Matcher& m) {
+        const auto& pattern_map = m.get_pattern_value_map();
+
+        const auto& input0 = pattern_map.at(input0_m).get_node_shared_ptr();
+        const auto& input1 = pattern_map.at(input1_m).get_node_shared_ptr();
+        const auto& convert = pattern_map.at(convert_m).get_node_shared_ptr();
+        auto output_type = convert->get_output_element_type(0);
+
+        auto gemm = ov::as_type_ptr<op::Gemm>(pattern_map.at(gemm_m).get_node_shared_ptr());
+        std::cout << "hohohoho: " << gemm->get_friendly_name() << std::endl;
+
+        auto new_gemm = std::make_shared<op::Gemm>(input0,
+                                                   input1,
+                                                   gemm->get_input0_transpose_order(),
+                                                   gemm->get_input1_transpose_order(),
+                                                   gemm->get_output_transpose_order(),
+                                                   output_type);
+
+        new_gemm->set_friendly_name(convert->get_friendly_name());
+        copy_runtime_info(m.get_matched_nodes(), new_gemm);
+        replace_node(convert, new_gemm);
+
+        return true;
+    };
+
+    auto m = std::make_shared<ov::pass::pattern::Matcher>(convert_m, "GemmConvertFusion");
     this->register_matcher(m, callback);
 }
 

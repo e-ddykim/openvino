@@ -94,8 +94,12 @@ ov::pass::activations_scaling::ScaleDownSingleLayer::ScaleDownSingleLayer(float 
         if (pattern_map.count(matmul_m))
             scaled_op = pattern_map.at(matmul_m).get_node_shared_ptr();
 
+        std::cout << "hohohoho: " << scaled_op->get_friendly_name() << std::endl;
+
         if (transformation_callback(scaled_op))
             return false;
+
+        std::cout << "       " << scaled_op->get_friendly_name() << " - 1 " << std::endl;
 
         // in the case of decompressed_to_f32 nodes, no need to apply activations scaling
         std::shared_ptr<ov::Node> output_of_scaled_op = scaled_op;
@@ -103,9 +107,10 @@ ov::pass::activations_scaling::ScaleDownSingleLayer::ScaleDownSingleLayer(float 
         if (scaled_op->get_output_target_inputs(0).size() == 1 && ov::is_type<ov::op::v0::Convert>(child_node) &&
             ov::fp16_compression_is_disabled(child_node->shared_from_this()) &&
             ov::pass::constant_folding_is_disabled(child_node->shared_from_this())) {
-            return false;
+            // return false;
         }
 
+        std::cout << "       " << scaled_op->get_friendly_name() << " - 2 " << std::endl;
         const std::vector<float> scale_up_value = {scale_factor};
         auto output_prec = output_of_scaled_op->output(0).get_element_type();
 
@@ -170,6 +175,7 @@ ov::pass::activations_scaling::ScaleDownSingleLayer::ScaleDownSingleLayer(float 
             in.replace_source_output(scale_up);
         }
 
+        std::cout << "       " << scaled_op->get_friendly_name() << " - 3 " << std::endl;
         return true;
     };
 
