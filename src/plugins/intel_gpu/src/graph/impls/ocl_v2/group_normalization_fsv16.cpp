@@ -37,18 +37,18 @@ ov::element::Type get_accumulator_type(const RuntimeParams& params) {
     }
 }
 
+size_t get_max_simd_size(const RuntimeParams& params) {
+    size_t max_simd_size = fsv;
+    for (auto& simd_size : params.get_device_info().supported_simd_sizes) {
+        max_simd_size = std::max(max_simd_size, simd_size);
+    }
+    return max_simd_size;
+};
+
 class GroupNormalizationGeneratorBase : public KernelGenerator {
 public:
     explicit GroupNormalizationGeneratorBase(std::string_view name, std::string_view suffix) : KernelGenerator(name, suffix) {}
     [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
-        auto get_max_simd_size = [](const RuntimeParams& params) {
-            size_t max_simd_size = fsv;
-            for (auto& simd_size : params.get_device_info().supported_simd_sizes) {
-                max_simd_size = std::max(max_simd_size, simd_size);
-            }
-            return max_simd_size;
-        };
-
         auto jit = KernelGenerator::get_jit_constants(params);
         auto desc = params.typed_desc<group_normalization>();
         jit.make("EPSILON", static_cast<float>(desc->epsilon));
@@ -235,25 +235,106 @@ protected:
             auto b = extract_channel(ChannelName::BATCH, ol);
 
             auto max_wgs = params.get_program().get_engine().get_device_info().max_work_group_size;
+            auto simd = get_max_simd_size(params);
 
             wgs.global[0] = x * y;
-            wgs.global[1] = ceil_div(f, fsv) * b;
+            wgs.global[1] = ceil_div(f, simd) * b;
             wgs.global[2] = 1;
 
             wgs.local[0] = x * y;
-            wgs.local[1] = ceil_div(f, fsv) * b;
+            wgs.local[1] = ceil_div(f, simd) * b;
             wgs.local[2] = 1;
 
             size_t divisor = 2;
-            while (wgs.local[0] > (max_wgs / fsv)) {
+            while (wgs.local[0] > (max_wgs / simd)) {
                 if (wgs.global[0] % divisor == 0) {
                     wgs.local[0] = wgs.global[0] / divisor;
                 }
                 divisor += 1;
             }
 
-            wgs.local[0] *= fsv;
-            wgs.global[0] *= fsv;
+            wgs.local[0] *= simd;
+            wgs.global[0] *= simd;
+
+            divisor = 2;
+            while ((wgs.local[0] * wgs.local[1]) > max_wgs) {
+                if (wgs.global[1] % divisor == 0) {
+                    wgs.local[1] = wgs.global[1] / divisor;
+                }
+                divisor += 1;
+            }
+        }};
+    }
+};
+
+class GroupNormalizationGeneratorFinalRemainderKernel : public GroupNormalizationGeneratorBase {
+public:
+    GroupNormalizationGeneratorFinalRemainderKernel() : GroupNormalizationGeneratorBase("group_normalization_fsv16", "final_remainder") {}
+
+protected:
+    [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
+        auto jit = GroupNormalizationGeneratorBase::get_jit_constants(params);
+        jit.make("GROUP_NORM_KERNEL_FINAL_REMAINDER", 1);
+
+        if (params.has_fused_primitives()) {
+            const auto& out_l = params.get_output_layout(0);
+            FusedOpsConfiguration conf = {"", std::vector<std::string>{"(b)", "(f)", "(y)", "(x)"}, "normalized", out_l.data_type};
+            jit.add(make_fused_ops_jit_constants(params, {conf}));
+        }
+
+        return jit;
+    }
+
+    [[nodiscard]] Arguments get_arguments_desc(const RuntimeParams& params) const override {
+        Arguments args;
+
+        if (params.is_dynamic()) {
+            args.push_back({ArgumentDescriptor::Types::SHAPE_INFO, 0});
+        }
+
+        args.push_back({ArgumentDescriptor::Types::INPUT, 0});
+        args.push_back({ArgumentDescriptor::Types::INPUT, 1});
+        args.push_back({ArgumentDescriptor::Types::INPUT, 2});
+        args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
+        add_fused_ops_arguments(args, params);
+        args.push_back({ArgumentDescriptor::Types::INTERNAL_BUFFER, 0});
+        args.push_back({ArgumentDescriptor::Types::INTERNAL_BUFFER, 1});
+
+        return args;
+    }
+
+    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
+        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
+            assert(!params.is_dynamic());
+            auto& wgs = kd.params.workGroups;
+            const auto& ol = params.output_layouts[0];
+            auto desc = params.typed_desc<group_normalization>();
+
+            auto x = extract_channel(ChannelName::X, ol);
+            auto y = extract_channel(ChannelName::Y, ol);
+            auto b = extract_channel(ChannelName::BATCH, ol);
+
+            auto max_wgs = params.get_program().get_engine().get_device_info().max_work_group_size;
+            auto simd = get_max_simd_size(params);
+
+            wgs.global[0] = x * y;
+            wgs.global[1] = b;
+            wgs.global[2] = 1;
+
+            wgs.local[0] = x * y;
+            wgs.local[1] = b;
+            wgs.local[2] = 1;
+
+            size_t divisor = 2;
+            while (wgs.local[0] > (max_wgs / simd)) {
+                if (wgs.global[0] % divisor == 0) {
+                    wgs.local[0] = wgs.global[0] / divisor;
+                }
+                divisor += 1;
+            }
+
+            wgs.local[0] *= simd;
+            wgs.global[0] *= simd;
 
             divisor = 2;
             while ((wgs.local[0] * wgs.local[1]) > max_wgs) {
@@ -273,12 +354,14 @@ public:
     Stage::Ptr calc_sqr_mean = make_stage<GroupNormalizationGeneratorCalcSQRMean>();
     Stage::Ptr calc_mean_variance = make_stage<GroupNormalizationGeneratorCalcMeanVariance>();
     Stage::Ptr final_normalize = make_stage<GroupNormalizationGeneratorFinalKernel>();
+    Stage::Ptr final_normalize_remainder = make_stage<GroupNormalizationGeneratorFinalRemainderKernel>();
 
     GroupNormalizationFsv16OptImpl() : PrimitiveImplOCL(GroupNormalizationFsv16Opt::get_type_info_static()) {}
     GroupNormalizationFsv16OptImpl(const program_node& node, const RuntimeParams& params) : GroupNormalizationFsv16OptImpl() {
         add_stage(calc_sqr_mean, params);
         add_stage(calc_mean_variance, params);
         add_stage(final_normalize, params);
+        add_stage(final_normalize_remainder, params);
     }
 
     std::unique_ptr<primitive_impl> clone() const override {
@@ -290,6 +373,39 @@ public:
         const auto& shape = params.output_layouts[0].get_partial_shape().get_max_shape();
         auto buf = BufferDescriptor{shape[0] * align_to(shape[1], fsv), ov::element::f32};
         return {buf, buf};
+    }
+
+    std::vector<size_t> get_stages_execution_order(const cldnn::primitive_inst& instance) const {
+        std::vector<size_t> stages_order = {0, 1};
+
+        const auto params = instance.get_impl_params();
+        auto simd = get_max_simd_size(*params);
+        const auto& ol = params->output_layouts[0];
+        auto f = extract_channel(ChannelName::FEATURE, ol);
+        if (f >= simd)
+            stages_order.push_back(2);
+
+        if (f % simd != 0)
+            stages_order.push_back(3);
+
+        return stages_order;
+    }
+
+    cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) override {
+        cldnn::stream& stream = instance.get_network().get_stream();
+        if (instance.can_be_optimized()) {
+            return stream.aggregate_events(events, false, instance.is_output());
+        }
+
+        update_rt_params(instance);
+
+        std::vector<cldnn::event::ptr> tmp_events(events);
+        const auto& exec_stages = get_stages_execution_order(instance);
+        for (const auto& stage_id : exec_stages) {
+            tmp_events = {execute_stage(tmp_events, instance, *_stages[stage_id])};
+        }
+
+        return tmp_events[0];
     }
 };
 

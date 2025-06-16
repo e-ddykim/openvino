@@ -97,7 +97,7 @@ KERNEL(calc_mean_variance_per_group)(
         }
     }
 }
-#elif GROUP_NORM_KERNEL_FINAL
+#else
 REQD_SUB_GROUP_SIZE(SIMD)
 KERNEL(group_normalization_b_fs_yx_fsv16)(
     OPTIONAL_SHAPE_INFO_ARG
@@ -111,15 +111,22 @@ KERNEL(group_normalization_b_fs_yx_fsv16)(
     const __global ACCUMULATOR_TYPE* internal_mean,
     const __global ACCUMULATOR_TYPE* internal_variance
 ) {
+#if GROUP_NORM_KERNEL_FINAL_REMAINDER
+    const uint b = get_global_id(1);
+    const uint f = (OUTPUT_FEATURE_NUM / SIMD) * SIMD + get_sub_group_local_id() % SIMD;
+#else
     const uint b = get_global_id(1) % OUTPUT_BATCH_NUM;
-    const uint f = get_global_id(1) / OUTPUT_BATCH_NUM * FSV + (get_sub_group_local_id() % FSV);
-    const uint yx = get_global_id(0) / FSV;
+    const uint f = get_global_id(1) / OUTPUT_BATCH_NUM * SIMD + (get_sub_group_local_id() % SIMD);
+#endif
+    const uint yx = get_global_id(0) / SIMD;
     const uint y = yx / OUTPUT_SIZE_X;
     const uint x = yx % OUTPUT_SIZE_X;
     const uint input_index = INPUT0_GET_INDEX(b, f, y, x);
     const uint output_index = OUTPUT_GET_INDEX(b, f, y, x);
 
+#if GROUP_NORM_KERNEL_FINAL_REMAINDER
     if (f < OUTPUT_FEATURE_NUM) {
+#endif
         const uint bf = b * OUTPUT_FEATURE_NUM + f;
         ACTIVATION_TYPE mean = TO_ACTIVATION_TYPE(internal_mean[bf]);
         ACTIVATION_TYPE variance = TO_ACTIVATION_TYPE(internal_variance[bf]);
@@ -131,10 +138,12 @@ KERNEL(group_normalization_b_fs_yx_fsv16)(
         #else
             output[output_index] = TO_OUTPUT_TYPE(normalized);
         #endif
+#if GROUP_NORM_KERNEL_FINAL_REMAINDER
     } else {
         #ifdef OUTPUT_LAYOUT_B_FS_YX_FSV16
             output[output_index] = OUTPUT_VAL_ZERO;
         #endif
     }
+#endif
 }
 #endif
