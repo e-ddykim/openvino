@@ -171,8 +171,8 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     const uint subsequence_begin = subsequence_begins[gws_mapping];
     const uint subsequence_end = subsequence_begins[gws_mapping + 1];
     const uint subsequence_query_block_idx = block_start_pos - subsequence_begin;
-    const int k = subsequence_end - subsequence_begin;
-    const int q = k;
+    const int k = 16;
+    const int q = subsequence_end - subsequence_begin;
     const int d = HEAD_SIZE;
 #endif
     uint sg_ij = sub_group_broadcast(get_local_id(1), 0);
@@ -188,9 +188,11 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 
     /* Leading dimension for matrices */
 #if IS_PAGED_ATTENTION
-    uint ldk = HEAD_SIZE * KV_HEADS_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM;
+    // uint ldk = HEAD_SIZE * KV_HEADS_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM;
+    uint ldk = 16;
     uint ldq = HEAD_SIZE * HEADS_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM;
-    uint ldv = HEAD_SIZE * KV_HEADS_NUM + INPUT2_PAD_BEFORE_FEATURE_NUM + INPUT2_PAD_AFTER_FEATURE_NUM;
+    // uint ldv = HEAD_SIZE * KV_HEADS_NUM + INPUT2_PAD_BEFORE_FEATURE_NUM + INPUT2_PAD_AFTER_FEATURE_NUM;
+    uint ldv = HEAD_SIZE;
     uint lda = HEAD_SIZE * HEADS_NUM;
 #else
     uint ldk = TRANSPOSE_K ? KEY_S3 : KEY_S2;
@@ -235,22 +237,58 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
             + S_sum_slm_size + S_max_slm_size];
 
     const bool need_sum_barrier = (ugemm_vs_barrier_count == 0);
+    if (get_global_id(0) == 0 && get_global_id(1) == 0 && get_global_id(2) == 0) {
+        // printf("QRY_D: %d %d %d %d\n", QRY_D.array[0], QRY_D.array[1], QRY_D.array[2], QRY_D.array[3]);
+        // printf("KEY_D: %d %d %d %d\n", KEY_D.array[0], KEY_D.array[1], KEY_D.array[2], KEY_D.array[3]);
 
+        printf("%d %d %d\n", KEY_S2, KEY_S3, ldk);
+        printf("%d %d %d\n", ldq, ldv, lda);
+
+        printf("%d %d %d\n", d, k, q);
+
+        printf("%d, %d, %d\n", D_MAX, ugemm_kq_wg_tile_n, Q_slm_size);
+        // for (int aaa = 0; aaa < 2; aaa++) {
+        //     for (int bbb = 0; bbb < 64; bbb++) {
+        //         for (int ccc = 0; ccc < 16; ccc++) {
+        //             int iii = aaa * 64 * 16 + bbb * 16 + ccc;
+        //             printf("%f ", K[iii]);
+        //         }
+        //         printf("\n");
+        //     }
+        //     printf("\n");
+        // }
+        // printf("\n");
+    }
     /* Locate K/Q/V/A matrices within batch */
 #if IS_PAGED_ATTENTION
     K += subsequence_begin * ldk
-       + b0_kv * HEAD_SIZE + INPUT1_PAD_BEFORE_FEATURE_NUM;
+       + b0_kv * HEAD_SIZE * 16;
+//        + b0_kv * HEAD_SIZE + INPUT1_PAD_BEFORE_FEATURE_NUM;
     Q += subsequence_begin * ldq
        + b0 * HEAD_SIZE + INPUT0_PAD_BEFORE_FEATURE_NUM;
     V += subsequence_begin * ldv
-       + b0_kv * HEAD_SIZE + INPUT2_PAD_BEFORE_FEATURE_NUM;
+       + b0_kv * HEAD_SIZE * 16;
+//        + b0_kv * HEAD_SIZE + INPUT2_PAD_BEFORE_FEATURE_NUM;
     A += subsequence_begin * lda
        + b0 * HEAD_SIZE;
+//     int tmp_k, tmp_q, tmp_v, tmp_a;
+//     tmp_k = subsequence_begin * ldk + b0_kv * HEAD_SIZE * 16;
+//     tmp_q = subsequence_begin * ldq + b0 * HEAD_SIZE + INPUT0_PAD_BEFORE_FEATURE_NUM;
+//     tmp_v = subsequence_begin * ldv + b0_kv * HEAD_SIZE * 16;
+//     tmp_a = subsequence_begin * lda + b0 * HEAD_SIZE;
+//     printf("b0: %d, b1: %d, b0_kv:%d, tmp_k: %d, tmp_q: %d, tmp_v: %d, tmp_a: %d\n", b0, b1, b0_kv, tmp_k, tmp_q, tmp_v, tmp_a);
 #else
     K += (KEY_OFF(b1, b0_kv, 0, 0) + INPUT1_OFFSET) / KEY_ELEMENTS_PER_BYTE;
     Q += (QRY_OFF(b1, b0, 0, 0) + INPUT0_OFFSET);
     V += (VAL_OFF(b1, b0_kv, 0, 0) + INPUT2_OFFSET) / VAL_ELEMENTS_PER_BYTE;
     A += DST_OFF(b1, b0, 0, 0, 0);
+
+//     int tmp_k, tmp_q, tmp_v, tmp_a;
+//     tmp_k = (KEY_OFF(b1, b0_kv, 0, 0) + INPUT1_OFFSET) / KEY_ELEMENTS_PER_BYTE;
+//     tmp_q = (QRY_OFF(b1, b0, 0, 0) + INPUT0_OFFSET);
+//     tmp_v = (VAL_OFF(b1, b0_kv, 0, 0) + INPUT2_OFFSET) / VAL_ELEMENTS_PER_BYTE;
+//     tmp_a = DST_OFF(b1, b0, 0, 0, 0);
+//     printf("b0: %d, b1: %d, b0_kv:%d, tmp_k: %d, tmp_q: %d, tmp_v: %d, tmp_a: %d\n", b0, b1, b0_kv, tmp_k, tmp_q, tmp_v, tmp_a);
 #if WITH_ATTN_MASK
     uint ldmsk = MSK_S2;
     msk += MSK_OFF(b1 % MSK_D0, b0 % MSK_D1, 0, 0);
@@ -444,6 +482,32 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #endif
                 );
 
+        if (get_local_id(0) == 0 && get_local_id(1) == 0 && get_local_id(2) == 0 && b0 == 0) {
+            printf("%d %d\n", sg_i_kq, sg_j_kq);
+            for (int iii = 0; iii < 8; iii++) {
+                for (int jjj = 0; jjj < 8; jjj++) {
+                    printf("%f ", S_tile.x[iii][jjj]);
+                }
+                printf("\n");
+                // printf("%f ", Q_slm[jjj + 0]);
+            }
+            printf("\n");
+        //     for (int iii = 0; iii < 256; iii++) {
+        //         for (int jjj = 0; jjj < 16; jjj++) {
+        //             int ddd = iii * 16 + jjj;
+        //             printf("%f ", Q_slm[ddd]);
+        //         }
+        //         printf("\n");
+        //         // printf("%f ", Q_slm[jjj + 0]);
+        //     }
+        //     printf("\n");
+        //     for (int jjj = 0; jjj < 15; jjj++) {
+        //         // printf("%f ", S_tile.x[0][jjj]);
+        //         printf("%f ", Q_slm[jjj + 128]);
+        //     }
+        //     printf("\n");
+        }
+
 #if KEY_SCALES == QUANTIZE_COMMON
 #define k_scale_op(x) ((x)*k_scale)
         tile_elementwise(S_tile, k_scale_op);
@@ -467,10 +531,15 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #endif
 
 #if IS_CAUSAL
-#define greater_than(offset_k, offset_q) (offset_k > offset_q)
+#define less_than(offset_k, offset_q) (offset_q < offset_k)
+
+        int col_offset = wg_j0 + sg_j0_kq;
+        //if (attn_mask_type == ATTN_MASK_BOTTOM_RIGHT) 
+            col_offset += k - q;
+
         /* Apply causal mask */
-        tile_predicated_assignment_t(S_tile, k0 + sg_i0_kq, wg_j0 + sg_j0_kq,
-                greater_than, -INFINITY, SUBGROUP_SIZE, ugemm_kq_c_type_block0,
+        tile_predicated_assignment_t(S_tile, k0 + sg_i0_kq, col_offset,
+                less_than, -INFINITY, SUBGROUP_SIZE, ugemm_kq_c_type_block0,
                 ugemm_kq_c_type_block1, ugemm_kq_c_type_nblock0,
                 ugemm_kq_c_type_nblock1);
 #endif

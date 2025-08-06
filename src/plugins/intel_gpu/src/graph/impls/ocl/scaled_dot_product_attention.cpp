@@ -326,12 +326,12 @@ public:
         if (has_indirect_inputs(impl_param))
             data_inputs_num--;
 
-        if (desc->scale_val.has_value()) {
-            data_inputs_num--;
-        }
-        if (desc->attn_mask_val.has_value()) {
-            data_inputs_num--;
-        }
+        // if (desc->scale_val.has_value()) {
+        //     data_inputs_num--;
+        // }
+        // if (desc->attn_mask_val.has_value()) {
+        //     data_inputs_num--;
+        // }
 
         auto has_zp_input_buffers = desc->get_compression_zp_inputs_num() > 0;
         if (desc->is_kv_compressed) {
@@ -346,12 +346,12 @@ public:
             params.inputs[i] = convert_data_tensor(impl_param.get_input_layout(i));
         }
 
-        if (desc->scale_val.has_value()) {
-            data_inputs_num++;
-        }
-        if (desc->attn_mask_val.has_value()) {
-            data_inputs_num++;
-        }
+        // if (desc->scale_val.has_value()) {
+        //     data_inputs_num++;
+        // }
+        // if (desc->attn_mask_val.has_value()) {
+        //     data_inputs_num++;
+        // }
 
         auto extend_order_in_num_heads_dim = [](const std::vector<int64_t>& order, size_t rank = 4) {
             if (order.size() == rank) {
