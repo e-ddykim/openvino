@@ -73,9 +73,12 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
             mem_lock<int32_t, mem_lock_type::read> past_lens_mem_lock(past_lens_mem, *impl_param.strm);
 
             const auto past_lens_size = past_lens_mem_lock.size();
-            for (size_t i = 0; i < past_lens_size; i++) {
-                if (past_lens_mem_lock[i] != 0) {
-                    return PagedAttentionStage::MIXED;
+            std::cout << "past_lens: " << past_lens_mem_lock[0] << std::endl;
+            if (past_lens_size > 0) {
+                for (size_t i = 0; i < past_lens_size; i++) {
+                    if (past_lens_mem_lock[i] != 0) {
+                        return PagedAttentionStage::MIXED;
+                    }
                 }
             }
 
@@ -243,9 +246,12 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
                              instance.value_cache_memory_ptr() };
         } else if (stage == Stage::SDPA) {
             args.inputs = {  instance.query_memory_ptr(),
-                             instance.key_memory_ptr(),
-                             instance.value_memory_ptr(),
-                             instance.subsequence_begins_memory_ptr() };
+                             instance.key_cache_memory_ptr(),
+                             instance.value_cache_memory_ptr(),
+                             instance.subsequence_begins_memory_ptr(),
+                             instance.past_lens_memory_ptr(),
+                             instance.block_indices_memory_ptr(),
+                             instance.block_indices_begins_memory_ptr() };
 
             if (!desc->scale_val.has_value()) {
                 args.inputs.push_back(instance.input_memory_ptr(9));
@@ -582,6 +588,9 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
     event::ptr execute_impl(const std::vector<event::ptr>& events, paged_attention_inst& instance) override {
         const auto stage = get_paged_attention_stage(*instance.get_impl_params());
         const auto is_mixed_mode = stage == PagedAttentionStage::MIXED;
+
+        if (is_mixed_mode)
+            std::cout << "MIXED" << std::endl;
 
         prepare_internal_buffers(instance, stage);
 
@@ -1086,6 +1095,8 @@ struct paged_attention_impl : multi_stage_primitive<paged_attention> {
             input_tensors.emplace_back(convert_data_tensor(input_layout));
 
         const auto& desc = impl_param.typed_desc<paged_attention>();
+        // if (desc->id.compare("pagedattentionextension:PagedAttentionExtension_25287") == 0)
+        //     std::cout << "!" << std::endl;
         auto kv_cache_update_kernel_params = get_kv_cache_update_kernel_params(impl_param, stage, input_tensors, impl_param.is_dynamic());
         auto& kv_cache_update_kernel_selector = kv_cache_update_kernel_selector_t::Instance();
         kernels_data.push_back(kv_cache_update_kernel_selector.get_best_kernel(kv_cache_update_kernel_params));
