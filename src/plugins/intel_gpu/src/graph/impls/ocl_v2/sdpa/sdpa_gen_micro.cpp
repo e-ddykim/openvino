@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#ifndef ENABLE_ONEDNN_FOR_GPU
+#define ENABLE_ONEDNN_FOR_GPU
+#endif
+
 #ifdef ENABLE_ONEDNN_FOR_GPU
 // clang-format off
 // Put this file at first to avoid incorrect header files includes order.
@@ -33,6 +37,8 @@ size_t get_subgroup_size(gpu_arch arch) {
         return 0;
     }
 }
+
+constexpr size_t paged_attention_block_size = 16;
 
 inline size_t get_d_max(size_t head_size) {
     for (size_t i = 32; i <= 1024; i *= 2) {
@@ -271,7 +277,7 @@ sdpa_config_t xehpg_h32_2nd = {8, 32, 16, 8, 8, 1, 2, 4};
 sdpa_config_t xehpg_q_h32 = {32, 16, 16, 16, 2, 8, 2, 8};
 sdpa_config_t xehpg_q_h32_2nd = {32, 16, 8, 8, 8, 1, 4, 2};
 
-sdpa_config_t xehpg_h64 = {32, 16, 16, 16, 4, 8, 4, 8};
+sdpa_config_t xehpg_h64 = {16, 16, 16, 16, 8, 8, 8, 8};
 sdpa_config_t xehpg_h64_s128 = {16, 16, 16, 16, 4, 8, 4, 8};
 sdpa_config_t xehpg_h64_s64 = {32, 16, 16, 8, 8, 4, 4, 8};
 sdpa_config_t xehpg_h64_2nd = {8, 16, 16, 8, 8, 1, 4, 2};
@@ -285,7 +291,7 @@ sdpa_config_t xehpg_q_h64_s64_2nd = {8, 8, 8, 8, 8, 2, 8, 2};
 sdpa_config_t xehpg_q_h64_s128_2nd = {16, 8, 8, 8, 8, 4, 8, 4};
 sdpa_config_t xehpg_q_h64_2nd = {16, 16, 8, 8, 16, 2, 8, 4};
 
-sdpa_config_t xehpg_h128 = {16, 16, 32, 8, 8, 4, 4, 8};
+sdpa_config_t xehpg_h128 = {16, 16, 16, 16, 8, 4, 8, 4};
 sdpa_config_t xehpg_h128_s32 = {16, 16, 16, 8, 16, 2, 8, 4};
 sdpa_config_t xehpg_h128_2nd = {8, 16, 16, 8, 16, 1, 8, 2};
 
@@ -985,6 +991,7 @@ JitConstants SDPAMicroGenerator::get_jit_constants(const kernel_impl_params& par
         }
     } else {
         jit.make("WITH_ATTN_MASK", 0);
+        jit.make("PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
     }
 
     if (config.has_const_scale_val) {
@@ -1096,9 +1103,9 @@ JitConstants SDPAMicroGenerator::get_jit_constants(const kernel_impl_params& par
 
     if (device_info.arch >= gpu_arch::xe_hpc) {
         jit.make("PREFETCH_MASK", 1);
-        jit.make("PREFETCH_K0", 1);
-        jit.make("PREFETCH_K", 1);
-        jit.make("PREFETCH_V", 1);
+        jit.make("PREFETCH_K0", config.is_paged_attention ? 0 : 1);
+        jit.make("PREFETCH_K", config.is_paged_attention ? 0 : 1);
+        jit.make("PREFETCH_V", config.is_paged_attention ? 0 : 1);
         bool no_rem = d_full && v_full && k_full;
         jit.make("PREFETCH_REMAINDER", !no_rem);
         jit.make("PREFETCH_D_MAX", std::min<int64_t>(d_max, 64));
@@ -1190,17 +1197,25 @@ Arguments SDPAMicroGenerator::get_arguments_desc(const kernel_impl_params& param
 
     auto data_inputs_num = micro_get_input_num(params, config);
 
-    args.push_back({ArgumentDescriptor::Types::INPUT, 1});   // K
-    args.push_back({ArgumentDescriptor::Types::INPUT, 0});   // Q
-    args.push_back({ArgumentDescriptor::Types::INPUT, 2});   // V
-    args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});  // A
-
     if (config.is_paged_attention) {
+        args.push_back({ArgumentDescriptor::Types::INPUT, 3});   // Key cache
+        args.push_back({ArgumentDescriptor::Types::INPUT, 0});   // Q
+        args.push_back({ArgumentDescriptor::Types::INPUT, 4});   // Value cache
+        args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});  // A
+
         args.push_back({ArgumentDescriptor::Types::INPUT, 6});  // subsequence_begins
+        args.push_back({ArgumentDescriptor::Types::INPUT, 5});  // past_lens
+        args.push_back({ArgumentDescriptor::Types::INPUT, 7});  // block_indices
+        args.push_back({ArgumentDescriptor::Types::INPUT, 8});  // block_indices_begins
         if (!config.has_const_scale_val)
             args.push_back({ArgumentDescriptor::Types::INPUT, 9});        // scale
-        args.push_back({ArgumentDescriptor::Types::INTERNAL_BUFFER, 3});  // blocked_indexes_start_and_gws_mapping
+        args.push_back({ArgumentDescriptor::Types::INTERNAL_BUFFER, 7});  // blocked_indexes_start_and_gws_mapping
     } else {
+        args.push_back({ArgumentDescriptor::Types::INPUT, 1});   // K
+        args.push_back({ArgumentDescriptor::Types::INPUT, 0});   // Q
+        args.push_back({ArgumentDescriptor::Types::INPUT, 2});   // V
+        args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});  // A
+
         const uint32_t attn_mask_idx = 3;
         const uint32_t scale_idx = 4;
         if (config.input_num > attn_mask_idx && !config.has_const_attn_mask_val)
@@ -1374,7 +1389,7 @@ void SDPAMicroGenerator::init_microkernels(const kernel_impl_params& params,
     problem.Ts = problem.Tc;
 
     auto problem_kq = problem;
-    problem_kq.A.layout = micro::MatrixLayout::T;
+    problem_kq.A.layout = is_paged_attention ? micro::MatrixLayout::N : micro::MatrixLayout::T;
 
     /* Set up microkernel options */
     micro::GEMMProtocol::Options opts_kq;
