@@ -1218,6 +1218,8 @@ void primitive_inst::update_shape_info_tensor(const kernel_impl_params& params) 
 }
 
 void primitive_inst::update_impl(bool use_async_compilation) {
+    // if (id().compare("pagedattentionextension:PagedAttentionExtension_25287") == 0)
+    //     std::cout << "!" << std::endl;
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("update_impl: " + id()));
     GPU_DEBUG_PROFILED_STAGE(instrumentation::pipeline_stage::update_implementation);
     auto prev_impl_str =  _impl != nullptr ? _impl->get_kernel_name() : "nullptr";
@@ -1876,7 +1878,8 @@ void primitive_inst::prepare_primitive() {
         GPU_DEBUG_TRACE_DETAIL << "- inputs[" << i << "] : " <<  _deps[i].first->id() << std::endl;
     }
     GPU_DEBUG_TRACE_DETAIL << "-----------------------------------------------------------------" << std::endl;
-
+    // if (id().compare("pagedattentionextension:PagedAttentionExtension_25287") == 0)
+    //     std::cout << "!" << std::endl;
     // If it is optimized out or skipped for zero dimension at the previous iteration,
     // Set this flag true to reset output memory in realloc_if_needed.
     const bool prev_execution_skipped = can_be_optimized()

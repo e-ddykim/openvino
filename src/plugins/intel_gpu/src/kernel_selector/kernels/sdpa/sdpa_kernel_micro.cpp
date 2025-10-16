@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#ifdef ENABLE_ONEDNN_FOR_GPU
+// #ifdef ENABLE_ONEDNN_FOR_GPU
 
 #include "sdpa_kernel_micro.h"
 #include "common_tools.h"
@@ -36,6 +36,8 @@ size_t subgroup_size(gpu_arch arch) {
     }
 }
 
+constexpr size_t paged_attention_block_size = 16;
+
 inline int64_t get_d_max(int64_t head_size) {
     for (int64_t i = 32; i <= 1024; i *= 2)
         if (head_size <= i)
@@ -67,11 +69,11 @@ Tensor::Dim get_num_heads(const sdpa_params& params, const DataTensor& qkv, cons
     return normalize_dims(qkv)[order[1]];
 }
 
-Tensor::Dim get_seq_length(const sdpa_params& params, const DataTensor& qkv, const std::vector<int64_t>& order) {
+Tensor::Dim get_seq_length(const sdpa_params& params, const DataTensor& qkv, const std::vector<int64_t>& order, const bool transposed = false) {
     if (params.conf.is_paged_attention)
         return Tensor::Dim(params.conf.paged_attention_aligned_seq_len);
 
-    return normalize_dims(qkv)[order[2]];
+    return transposed ? normalize_dims(qkv)[order[3]] : normalize_dims(qkv)[order[2]];
 }
 
 struct sdpa_config_t {
@@ -94,10 +96,10 @@ sdpa_config_t xehpg_h32_2nd = {8, 32, 16, 8, 8, 1, 2, 4};
 sdpa_config_t xehpg_q_h32 = {32, 16, 16, 16, 2, 8, 2, 8};
 sdpa_config_t xehpg_q_h32_2nd = {32, 16, 8, 8, 8, 1, 4, 2};
 
-sdpa_config_t xehpg_h64 = {32, 16, 16, 16, 4, 8, 4, 8};
-sdpa_config_t xehpg_h64_s128 = {16, 16, 16, 16, 4, 8, 4, 8};
-sdpa_config_t xehpg_h64_s64 = {32, 16, 16, 8, 8, 4, 4, 8};
-sdpa_config_t xehpg_h64_2nd = {8, 16, 16, 8, 8, 1, 4, 2};
+sdpa_config_t xehpg_h64 = {16, 16, 16, 16, 8, 8, 8, 8};
+// sdpa_config_t xehpg_h64_s128 = {16, 16, 16, 16, 4, 4, 4, 4};
+// sdpa_config_t xehpg_h64_s64 = {32, 16, 16, 8, 8, 4, 4, 8};
+// sdpa_config_t xehpg_h64_2nd = {8, 16, 16, 8, 8, 1, 4, 2};
 
 sdpa_config_t xehpg_q_h64 = {32, 16, 16, 16, 4, 8, 4, 8};
 sdpa_config_t xehpg_q_h64_s128 = {16, 16, 16, 8, 8, 4, 4, 8};
@@ -271,9 +273,9 @@ sdpa_config_t *choose_config_xehpg(int head_size, int seq, bool thin_q, bool qua
                 return &xehpg_q_h64;
             }
         }
-        if (thin_q) return &xehpg_h64_2nd;
-        if (seq <= 64) return &xehpg_h64_s64;
-        if (seq <= 128) return &xehpg_h64_s128;
+        // if (thin_q) return &xehpg_h64_2nd;
+        // if (seq <= 64) return &xehpg_h64_s64;
+        // if (seq <= 128) return &xehpg_h64_s128;
         return &xehpg_h64;
     } else if (head_size <= 128) {
         if (seq <= 0 && is_pa) return &xehpg_h128;
@@ -509,14 +511,14 @@ void SDPAKernelMicro::init_microkernels(const sdpa_params& params, micro::Packag
     const auto k_head_size = params.conf.k_head_size;
     const auto v_head_size = params.conf.v_head_size;
     const auto d_max = get_d_max(k_head_size);
-    const Tensor::Dim n_keys = get_seq_length(params, K, params.input1_order);
+    const Tensor::Dim n_keys = get_seq_length(params, K, params.input1_order, true);
     const Tensor::Dim n_queries = get_seq_length(params, Q, params.input0_order);
     const Tensor::Dim n_values = Tensor::Dim(v_head_size);
     const auto batch = out.Batch().v * out.Feature().v;
 
     /* Retrieve pre-tuned kernel configuration */
     sdpa_config_t *config = nullptr;
-    bool thin_q = (!n_queries.is_dynamic && (n_queries.v <= 16)) || !is_prefill;
+    bool thin_q = true;//(!n_queries.is_dynamic && (n_queries.v <= 16)) || !is_prefill;
     bool is_integrated = params.engineInfo.deviceType == dev_type::integrated_gpu;
 
     bool is_quantized = (K.GetDType() == Datatype::UINT8 || K.GetDType() == Datatype::INT8) ||
@@ -558,7 +560,7 @@ void SDPAKernelMicro::init_microkernels(const sdpa_params& params, micro::Packag
     problem.Ts = problem.Tc;
 
     auto problem_kq = problem;
-    problem_kq.A.layout = micro::MatrixLayout::T;
+    problem_kq.A.layout = micro::MatrixLayout::N;
 
     /* Set up microkernel options */
     micro::GEMMProtocol::Options opts_kq;
@@ -724,7 +726,7 @@ bool SDPAKernelMicro::Validate(const Params& p) const {
     auto K_num_heads_dim = get_num_heads(params, params.inputs[1], params.input1_order);
     auto V_num_heads_dim = get_num_heads(params, params.inputs[2], params.input2_order);
 
-    if (params.input0_order[3] != 3 || params.input1_order[3] != 3 || params.input2_order[3] != 3)
+    if (params.input0_order[3] != 3 || params.input2_order[3] != 3)
         DO_NOT_USE_THIS_KERNEL(p.layerID);
 
     if (Q_num_heads_dim.is_dynamic || K_num_heads_dim.is_dynamic || V_num_heads_dim.is_dynamic || K_num_heads_dim.v != V_num_heads_dim.v)
@@ -786,7 +788,7 @@ JitConstants SDPAKernelMicro::GetJitConstants(const sdpa_params& params, const m
     auto lda = v_head_size * prim_params.outputs[0].ElementSize();
 
     const auto d_max = get_d_max(k_head_size);
-    const auto n_keys = get_seq_length(params, K, prim_params.input1_order);
+    const auto n_keys = get_seq_length(params, K, prim_params.input1_order, true);
     const auto n_queries = get_seq_length(params, Q, prim_params.input0_order);
     const auto n_values = Tensor::Dim(v_head_size);
 
@@ -797,6 +799,7 @@ JitConstants SDPAKernelMicro::GetJitConstants(const sdpa_params& params, const m
     jit.AddConstant(MakeJitConstant("D_MAX", d_max));
     jit.AddConstant(MakeJitConstant("SUBGROUP_SIZE", subgroup_size(prim_params.engineInfo.arch)));
     jit.AddConstant(MakeJitConstant("INVERT_SCALE", false));
+    // jit.AddConstant(MakeJitConstant("SOFTMAX_INF_AS_ZERO", true));
     jit.AddConstant(MakeJitConstant("SCALE_DATA_T", "half"));
     jit.AddConstant(MakeJitConstant("HEAD_SIZE", k_head_size));
 
@@ -813,6 +816,7 @@ JitConstants SDPAKernelMicro::GetJitConstants(const sdpa_params& params, const m
         }
     } else {
         jit.AddConstant(MakeJitConstant("WITH_ATTN_MASK", 0));
+        jit.AddConstant(MakeJitConstant("PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size));
     }
 
     if (params.conf.has_const_scale_val) {
@@ -910,9 +914,9 @@ JitConstants SDPAKernelMicro::GetJitConstants(const sdpa_params& params, const m
 
     if (params.engineInfo.arch >= gpu_arch::xe_hpc) {
         jit.AddConstant(MakeJitConstant("PREFETCH_MASK", 1));
-        jit.AddConstant(MakeJitConstant("PREFETCH_K0", 1));
-        jit.AddConstant(MakeJitConstant("PREFETCH_K", 1));
-        jit.AddConstant(MakeJitConstant("PREFETCH_V", 1));
+        jit.AddConstant(MakeJitConstant("PREFETCH_K0", 0));
+        jit.AddConstant(MakeJitConstant("PREFETCH_K", 0));
+        jit.AddConstant(MakeJitConstant("PREFETCH_V", 0));
         bool no_rem = d_full && v_full && k_full;
         jit.AddConstant(MakeJitConstant("PREFETCH_REMAINDER", !no_rem));
         jit.AddConstant(MakeJitConstant("PREFETCH_D_MAX", std::min<int64_t>(d_max, 64)));
@@ -1007,7 +1011,7 @@ CommonDispatchData SDPAKernelMicro::SetDefault(const sdpa_params& params, const 
     dispatch_data.gws = dispatch_data.lws;
 
     auto seq_length = get_seq_length(params, params.inputs[0], params.input0_order).v;
-    auto heads_num = params.conf.is_paged_attention ? params.conf.heads_num : params.outputs[0].Feature().v;
+    auto heads_num = params.conf.is_paged_attention ? params.conf.heads_num : get_num_heads(params, params.outputs[0], params.output_order).v;
     auto batch_size = params.conf.is_paged_attention ? 1 : params.outputs[0].Batch().v;
 
     dispatch_data.gws[0] *= CeilDiv(seq_length, wg_tile_q);
@@ -1045,6 +1049,9 @@ clKernelData SDPAKernelMicro::get_kernel_data(const sdpa_params& params, bool is
 
     if (params.conf.is_paged_attention) {
         kernel.params.arguments.push_back({ArgumentDescriptor::Types::INPUT, 3}); // subsequence_begins
+        kernel.params.arguments.push_back({ArgumentDescriptor::Types::INPUT, 4}); // past_lens
+        kernel.params.arguments.push_back({ArgumentDescriptor::Types::INPUT, 5}); // block_indices
+        kernel.params.arguments.push_back({ArgumentDescriptor::Types::INPUT, 6}); // block_indices_begins
         if (params.inputs.size() >= 5)
             kernel.params.arguments.push_back({ArgumentDescriptor::Types::INPUT, 4}); // scale
 
@@ -1154,7 +1161,7 @@ void SDPAKernelMicro::GetUpdateDispatchDataFunc(KernelData& kd) const {
         const auto& K = prim_params.inputs[1];
 
         const auto n_queries = get_seq_length(prim_params, Q, prim_params.input0_order);
-        const auto n_keys = get_seq_length(prim_params, K, prim_params.input1_order);
+        const auto n_keys = get_seq_length(prim_params, K, prim_params.input1_order, true);
 
         auto v_head_size = prim_params.conf.v_head_size;
 
@@ -1222,4 +1229,4 @@ size_t SDPAKernelMicro::GetTileQSize(const KernelData& kernel_data) {
 
 }  // namespace kernel_selector
 
-#endif // ENABLE_ONEDNN_FOR_GPU
+// #endif // ENABLE_ONEDNN_FOR_GPU

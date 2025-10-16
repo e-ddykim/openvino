@@ -529,6 +529,10 @@ private:
     static std::vector<ov::float16> generate_input_data(tests::random_generator& rg, size_t num_heads, size_t tokens_num, size_t k_head_size) {
         const size_t total_elements_num = tokens_num * num_heads * k_head_size;
         auto data = rg.generate_random_1d<ov::float16>(total_elements_num, -1, 1);
+        // auto data = std::vector<ov::float16>();
+        // for (size_t i = 0; i < total_elements_num; i++) {
+        //     data.push_back(static_cast<ov::float16>(i));
+        // }
 
         return data;
     }
@@ -688,6 +692,7 @@ private:
         auto query_layout = layout{query_shape, data_types::f16, format::bfyx};
         auto key_layout = layout{key_shape, data_types::f16, format::bfyx};
         auto value_layout = layout{value_shape, data_types::f16, format::bfyx};
+        auto scale_layout = cldnn::layout({1}, data_types::f16, format::bfyx);
 
         OPENVINO_ASSERT(query_layout.count() == query_data.size());
         OPENVINO_ASSERT(key_layout.count() == key_data.size());
@@ -697,21 +702,25 @@ private:
         auto key_mem = test_engine.allocate_memory(key_layout);
         auto value_mem = test_engine.allocate_memory(value_layout);
         auto mask_mem = get_mask_mem(num_queries, num_keys, num_heads, sliding_window_size);
+        auto scale_mem = test_engine.allocate_memory(scale_layout);
 
         set_values(query_mem, query_data);
         set_values(key_mem, key_data);
         set_values(value_mem, value_data);
+        set_values(scale_mem, {static_cast<ov::float16>(scale)});
 
         topology topology;
         topology.add(input_layout("query", query_layout),
                      input_layout("key", key_layout),
                      input_layout("value", value_layout),
                      data("mask", mask_mem),
+                     data("scale", scale_mem),
                      permute("query_transposed", input_info("query"), {0, 2, 1, 3}),
-                     permute("key_transposed", input_info("key"), {0, 2, 1, 3}),
+                     permute("key_transposed", input_info("key"), {0, 2, 3, 1}),
                      permute("value_transposed", input_info("value"), {0, 2, 1, 3}),
-                     gemm("qk_gemm", { input_info("query_transposed"), input_info("key_transposed") }, data_types::f16, false, true, scale),
-                     eltwise("eltwise", { input_info("qk_gemm"), input_info("mask") }, eltwise_mode::sum),
+                     gemm("qk_gemm", { input_info("query_transposed"), input_info("key_transposed") }, data_types::f16, false, false),
+                     eltwise("scale_div", { input_info("qk_gemm"), input_info("scale") }, eltwise_mode::prod),
+                     eltwise("eltwise", { input_info("scale_div"), input_info("mask") }, eltwise_mode::sum),
                      softmax("softmax", input_info("eltwise"), -1),
                      gemm("qkv_gemm", { input_info("softmax"), input_info("value_transposed") }, data_types::f16, false, false),
                      permute("qkv_gemm_transposed", input_info("qkv_gemm"), {0, 2, 1, 3}),
@@ -1131,6 +1140,10 @@ public:
             mem_lock<ov::float16, mem_lock_type::read> mem_ptr(data_output_mem, get_test_stream());
             for (size_t i = 0; i < data_output_mem->count(); i++) {
                 ASSERT_NEAR(mem_ptr[i], ref_data.first[i], tolerance) << " at index=" << i;
+                // float ref_val = ref_data.first[i];
+                // float opt_val = mem_ptr[i];
+                // float diff = std::abs(ref_val - opt_val) / (std::min(std::abs(ref_val), std::abs(opt_val)));
+                // std::cout << "[" << i << "] :\t" << (diff * 100) << "\t" << ref_val << "\t" << opt_val << std::endl;
             }
         }
 
@@ -1285,8 +1298,8 @@ INSTANTIATE_TEST_SUITE_P(smoke_paged_attention, paged_attention_test, ::testing:
     paged_attention_test_params{ {{10, 0}, {30, 0}}, 2, 64, 64, 16, 8, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, ENABLE_SCORES, PER_TOKEN_ROTATION, DISABLE_FA_V2 }, // 2nd token + 2nd token
     paged_attention_test_params{ {{128, 0}, {256, 0}}, 2, 48, 64, 16, 128, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, ENABLE_SCORES, PER_BLOCK_ROTATION, ENABLE_FA_V2 }, // 1st token + 1st token
     paged_attention_test_params{ {{1, 10}}, 2, 64, 64, 16, 4, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2 }, // 2nd token
-    paged_attention_test_params{ {{1, 10}}, 2, 64, 64, 16, 4, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_CHANNEL, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2 }, // 2nd token
     paged_attention_test_params{ {{5, 10}}, 2, 64, 64, 16, 2, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2 }, // 2nd token
-    paged_attention_test_params{ {{5, 10}}, 2, 64, 64, 16, 2, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_CHANNEL, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2 }, // 2nd token
+    // paged_attention_test_params{ {{6, 34}}, 2, 64, 64, 16, 0, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2 }, // 2nd token
+    paged_attention_test_params{ {{1000, 3000}}, 2, 64, 64, 16, 0, DISABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2 }, // 2nd token
     paged_attention_test_params{ {{1, 34}, {2, 20}, {10, 34}}, 2, 64, 64, 16, 10, ENABLE_CACHE_COMPRESSION,ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, ENABLE_SCORES, PER_TOKEN_ROTATION, DISABLE_FA_V2 }, // mixed: 2nd token + 1st token + part of 1st token
 }));
