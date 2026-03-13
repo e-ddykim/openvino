@@ -578,6 +578,7 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
         };
 
         auto fc_supports_fusings = [&](fully_connected_node& node) -> bool {
+            return false;
             auto& fused_prims = node.get_fused_primitives();
             if (std::any_of(fused_prims.begin(), fused_prims.end(), [](const fused_primitive_desc& f_desc) {
                     return f_desc.is_type<swiglu>();
@@ -595,6 +596,7 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
         };
 
         auto gemm_supports_fusings = [](gemm_node& node) -> bool {
+            return false;
             bool does_support_fusings = false;
             auto in0_dt = node.get_input_layout(0).data_type;
             auto in1_dt = node.get_input_layout(1).data_type;
