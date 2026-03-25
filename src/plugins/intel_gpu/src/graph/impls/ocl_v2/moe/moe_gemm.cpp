@@ -27,7 +27,7 @@ inline bool is_prefill_stage(const RuntimeParams& params) {
         return false;
     if (target_seq_len.is_dynamic())
         return false;
-    return (target_seq_len.get_length() / num_offsets.get_length()) > 1;
+    return (target_seq_len.get_length() > num_offsets.get_length());
 }
 #endif
 
@@ -39,6 +39,7 @@ public:
 
     Stage::Ptr regular_micro_multi_tokens = make_stage<MoEGemmMicroGenerator>(prefill);
     Stage::Ptr regular_micro_single_token = make_stage<MoEGemmDecodeGenerator>();
+    // Stage::Ptr regular_micro_single_token = make_stage<MoEGemmMicroGenerator>(!prefill);
 #endif
 
     explicit MoEGemmImpl() : PrimitiveImplOCL(MoEGemm::get_type_info_static()) {}

@@ -311,26 +311,25 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(moe_gemm_decode
                                                                                 #endif
 ) {
     #if IS_UP_PHASE
-        #define OFM INTERMEDIATE_SIZE
+        #define N INTERMEDIATE_SIZE
     #else
-        #define OFM HIDDEN_SIZE
+        #define N HIDDEN_SIZE
     #endif
+    #define K HIDDEN_SIZE
 
     // global: [expert, SUBGROUP_SIZE, N//N_BLOCK],[1, SUBGROUP_SIZE, SUBGROUP_NUM]
     int expert_no = get_global_id(0);
-    #if !IS_UP_PHASE
-        input_ptr += expert_no * HIDDEN_SIZE;
-    #endif
-    out_ptr += expert_no * OFM;
+    input_ptr += expert_no * K;
+    out_ptr += expert_no * N;
 
     #if WEIGHT_COMPRESSEION_DT == 0
-        const int expert_wei_size = OFM * HIDDEN_SIZE / 2;
-        const int expert_scale_size = OFM * HIDDEN_SIZE / DOWN_GROUP_SIZE;
-        const int expert_zp_size = OFM * HIDDEN_SIZE / 2 / DOWN_GROUP_SIZE;
+        const int expert_wei_size = N * K / 2;
+        const int expert_scale_size = N * K / DOWN_GROUP_SIZE;
+        const int expert_zp_size = N * K / 2 / DOWN_GROUP_SIZE;
     #else
-        const int expert_wei_size = OFM * HIDDEN_SIZE;
-        const int expert_scale_size = OFM * HIDDEN_SIZE / DOWN_GROUP_SIZE;
-        const int expert_zp_size = OFM * HIDDEN_SIZE / DOWN_GROUP_SIZE;
+        const int expert_wei_size = N * K;
+        const int expert_scale_size = N * K / DOWN_GROUP_SIZE;
+        const int expert_zp_size = N * K / DOWN_GROUP_SIZE;
     #endif
     int expert_id = experts_ids[expert_no];
 
@@ -346,14 +345,11 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(moe_gemm_decode
     #endif
     __global OUTPUT_TYPE* bias = NULL;
     #ifdef BIAS_DT
-        bias = (__global OUTPUT_TYPE*)(bias_ptr + expert_id * OFM);
+        bias = (__global OUTPUT_TYPE*)(bias_ptr + expert_id * N);
     #endif
 
-    int N = OFM;
-    int K = HIDDEN_SIZE;
-
-    __local half x2[HIDDEN_SIZE];
-    __local float xg_sum[HIDDEN_SIZE / FAKE_GROUP_SIZE];
+    __local half x2[K];
+    __local float xg_sum[K / FAKE_GROUP_SIZE];
 
 #    if WEIGHT_COMPRESSEION_DT == 0
     //# interleaving x into x2
