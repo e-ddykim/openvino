@@ -34,26 +34,38 @@ struct moe_gemm : public primitive_base<moe_gemm> {
         WEIGHT_ZP = 7
     };
 
+    enum class MoEGemmPhase {
+        GATE = 0,
+        UP = 1,
+        DOWN = 2
+    };
+
     moe_gemm() : primitive_base("", {}) {}
 
     /// @brief Constructs moe_gemm primitive.
     ///
     moe_gemm(const primitive_id& id,
              const std::vector<input_info>& inputs,
-             const ov::intel_gpu::op::MOECompressed::Config& moe_config)
+             const ov::intel_gpu::op::MOECompressed::Config& moe_config,
+             const MoEGemmPhase& moe_phase)
           : primitive_base(id, inputs),
             num_experts_per_token(static_cast<int32_t>(moe_config.top_k)),
-            has_batch_dim(moe_config.has_batch_dim) {}
+            has_batch_dim(moe_config.has_batch_dim),
+            moe_config(moe_config),
+            moe_phase(moe_phase) {}
 
     bool has_bias = false;
     int32_t num_experts_per_token = 0;
     bool has_batch_dim = true;
+    ov::intel_gpu::op::MOECompressed::Config moe_config;
+    MoEGemmPhase moe_phase = MoEGemmPhase::UP;
 
     size_t hash() const override {
         size_t seed = primitive::hash();
         seed = hash_combine(seed, has_bias);
         seed = hash_combine(seed, num_experts_per_token);
         seed = hash_combine(seed, has_batch_dim);
+        seed = hash_combine(seed, static_cast<int>(moe_phase));
         return seed;
     }
 
@@ -63,7 +75,8 @@ struct moe_gemm : public primitive_base<moe_gemm> {
         auto rhs_casted = downcast<const moe_gemm>(rhs);
         return has_bias == rhs_casted.has_bias &&
                num_experts_per_token == rhs_casted.num_experts_per_token &&
-               has_batch_dim == rhs_casted.has_batch_dim;
+               has_batch_dim == rhs_casted.has_batch_dim &&
+               moe_phase == rhs_casted.moe_phase;
     }
 
     void save(BinaryOutputBuffer& ob) const override {
@@ -71,6 +84,8 @@ struct moe_gemm : public primitive_base<moe_gemm> {
         ob << has_bias;
         ob << num_experts_per_token;
         ob << has_batch_dim;
+        ob << make_data(&moe_config, sizeof(moe_config));
+        ob << make_data(&moe_phase, sizeof(moe_phase));
     }
 
     void load(BinaryInputBuffer& ib) override {
@@ -78,6 +93,8 @@ struct moe_gemm : public primitive_base<moe_gemm> {
         ib >> has_bias;
         ib >> num_experts_per_token;
         ib >> has_batch_dim;
+        ib >> make_data(&moe_config, sizeof(moe_config));
+        ib >> make_data(&moe_phase, sizeof(moe_phase));
     }
 };
 }

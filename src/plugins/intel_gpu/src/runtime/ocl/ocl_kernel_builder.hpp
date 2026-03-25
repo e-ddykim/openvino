@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <fstream>
+
 #include "intel_gpu/runtime/kernel_builder.hpp"
 #include "intel_gpu/runtime/device.hpp"
 
@@ -51,14 +53,34 @@ class ocl_kernel_builder : public kernel_builder{
                 OPENVINO_THROW("[GPU] Failed to create program during kernel build process");
             }
             cl::Program program(program_handle);
-            if (program.build({m_device.get_device()}, options.c_str()) != CL_SUCCESS) {
-                GPU_DEBUG_INFO << "-------- Kernel build error" << std::endl;
-                auto log = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>();
-                for (auto &e : log) {
-                    GPU_DEBUG_INFO << e.second;
+            try {
+                if (program.build({m_device.get_device()}, options.c_str()) != CL_SUCCESS) {
+                    GPU_DEBUG_INFO << "-------- Kernel build error" << std::endl;
+                    auto log = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>();
+                    for (auto &e : log) {
+                        GPU_DEBUG_INFO << e.second;
+                    }
+                    GPU_DEBUG_INFO << "-------- End of Kernel build error" << std::endl;
+                    OPENVINO_THROW("[GPU] Failed to build program");
                 }
-                GPU_DEBUG_INFO << "-------- End of Kernel build error" << std::endl;
-                OPENVINO_THROW("[GPU] Failed to build program");
+            } catch (const cl::BuildError& e) {
+                GPU_DEBUG_INFO << "-------- Kernel build error (cl::BuildError) --------" << std::endl;
+                for (auto& log_pair : e.getBuildLog()) {
+                    GPU_DEBUG_INFO << log_pair.second;
+                }
+                GPU_DEBUG_INFO << "-------- End of Kernel build error --------" << std::endl;
+                // Dump the failing kernel source
+                if (src_format == KernelFormat::SOURCE) {
+                    std::string src_str(reinterpret_cast<const char*>(src), src_bytes);
+                    std::ofstream dump("/tmp/failing_kernel.cl");
+                    if (dump.is_open()) {
+                        dump << "// Build options: " << options << "\n\n";
+                        dump << src_str;
+                        dump.close();
+                        GPU_DEBUG_INFO << "[GPU] Failing kernel source dumped to /tmp/failing_kernel.cl" << std::endl;
+                    }
+                }
+                OPENVINO_THROW("[GPU] Failed to build program: ", e.what());
             }
             cl::vector<cl::Kernel> kernels;
             if (program.createKernels(&kernels) != CL_SUCCESS) {

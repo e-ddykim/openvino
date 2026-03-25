@@ -6,6 +6,7 @@
 // clang-format on
 
 #include "moe_gemm.hpp"
+#include "moe_gemm_decode.hpp"
 
 #include "../primitive_ocl_base.hpp"
 #include "../utils/jitter.hpp"
@@ -36,8 +37,8 @@ public:
 #ifdef ENABLE_ONEDNN_FOR_GPU
     static constexpr bool prefill = true;
 
-    Stage::Ptr regular_micro_single_token = make_stage<MoEGemmMicroGenerator>(!prefill);
     Stage::Ptr regular_micro_multi_tokens = make_stage<MoEGemmMicroGenerator>(prefill);
+    Stage::Ptr regular_micro_single_token = make_stage<MoEGemmDecodeGenerator>();
 #endif
 
     explicit MoEGemmImpl() : PrimitiveImplOCL(MoEGemm::get_type_info_static()) {}

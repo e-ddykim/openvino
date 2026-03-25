@@ -270,7 +270,7 @@ ConvertMOEToMOECompressed::ConvertMOEToMOECompressed(bool is_pa) {
             config.hidden_size = weight_shape[2];
             if (weight_shape.size() == 4) config.hidden_size *= weight_shape[3];
             config.inter_size = weight_shape[1];
-            config.group_size = (weight_shape.size() == 3) ? config.hidden_size : scale_shape[3];
+            config.group_size = (scale_shape.size() == 3) ? config.hidden_size : (config.hidden_size / scale_shape[2]);
             config.top_k = topk_shape.rbegin()->get_length();
             config.out_type = ov::element::dynamic;
             config.has_batch_dim = is_pa ? 0 : 1;

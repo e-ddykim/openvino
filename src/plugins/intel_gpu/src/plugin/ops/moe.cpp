@@ -158,7 +158,7 @@ static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::o
             moe_gemm_up_inputs.push_back(input_infos[4]);  // scale_input_up
             down_idx = 6;
         }
-        auto moe_gemm_up = cldnn::moe_gemm(moe_gemm_up_name, moe_gemm_up_inputs, config);
+        auto moe_gemm_up = cldnn::moe_gemm(moe_gemm_up_name, moe_gemm_up_inputs, config, cldnn::moe_gemm::MoEGemmPhase::UP);
         moe_gemm_up.has_bias = true;
         p.add_primitive(*op, moe_gemm_up);
 
@@ -200,7 +200,7 @@ static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::o
             moe_gemm_down_inputs.push_back(input_infos[down_idx + 1]);  // scale_input_up
         }
 
-        auto moe_gemm_down = cldnn::moe_gemm(moe_gemm_down_name, moe_gemm_down_inputs, config);
+        auto moe_gemm_down = cldnn::moe_gemm(moe_gemm_down_name, moe_gemm_down_inputs, config, cldnn::moe_gemm::MoEGemmPhase::DOWN);
         moe_gemm_down.has_bias = true;
         p.add_primitive(*op, moe_gemm_down);
         auto moe_scatter_reduce_prim = cldnn::moe_scatter_reduction(moe_scatter_reduce_name,
