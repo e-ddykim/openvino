@@ -13,12 +13,14 @@
 namespace ov::intel_gpu::ocl {
 
 static size_t get_subgroup_size(gpu_arch arch) {
-    return arch >= gpu_arch::xe2 ? 32 : 16;
+    // return arch >= gpu_arch::xe2 ? 32 : 16;
+    return 16;
 }
 
 // Performance tuning parameters
-#define N_BLOCK      4
-#define SUBGROUP_NUM 8
+#define K_BLOCK      12
+#define N_BLOCK      64
+// #define SUBGROUP_NUM 16
 
 JitConstants MoEGemmDecodeGenerator::get_jit_constants(const RuntimeParams& params) const {
     auto jit = make_base_jit_constants(params);
@@ -38,8 +40,9 @@ JitConstants MoEGemmDecodeGenerator::get_jit_constants(const RuntimeParams& para
     jit.make("HIDDEN_SIZE", desc->moe_config.hidden_size);
     jit.make("INTERMEDIATE_SIZE", desc->moe_config.inter_size);
     jit.make("N_BLOCK", N_BLOCK);
+    jit.make("K_BLOCK", K_BLOCK);
     jit.make("SUBGROUP_SIZE", get_subgroup_size(info.arch));
-    jit.make("SUBGROUP_NUM", SUBGROUP_NUM);
+    // jit.make("SUBGROUP_NUM", SUBGROUP_NUM);
     jit.make("GATE_UP_GROUP_SIZE", gate_up_group_size);
     jit.make("DOWN_GROUP_SIZE", down_group_size);
     jit.make("MOE_DTYPE", params.get_input_layout(0).data_type == ov::element::f16 ? "half" : "float");
@@ -141,16 +144,21 @@ DispatchDataFunc MoEGemmDecodeGenerator::get_dispatch_data_func() const {
 
         size_t subgroup_size = get_subgroup_size(device_info.arch);
         size_t N = desc->moe_phase == moe_gemm::MoEGemmPhase::UP ? desc->moe_config.inter_size : desc->moe_config.hidden_size;
+        size_t K = desc->moe_config.hidden_size;
 
         auto& wgs = kd.params.workGroups;
-        wgs.global = {desc->moe_config.top_k, subgroup_size, static_cast<size_t>(N / N_BLOCK)};
-        wgs.local = {1, subgroup_size, SUBGROUP_NUM};
+        // wgs.global = {desc->moe_config.top_k, subgroup_size, static_cast<size_t>(N / N_BLOCK)};
+        // wgs.local = {1, subgroup_size, SUBGROUP_NUM};
+        wgs.global = {(N / N_BLOCK * subgroup_size), (K / subgroup_size / K_BLOCK), desc->moe_config.top_k};
+        wgs.local = {subgroup_size, (K /subgroup_size / K_BLOCK), 1};
     }};
 }
 
 Arguments MoEGemmDecodeGenerator::get_arguments_desc(const kernel_impl_params& params) const {
     Arguments args;
     auto cfg = get_moe_cfg(params);
+    if (params.is_dynamic())
+        args.push_back({ArgumentDescriptor::Types::SHAPE_INFO, 0});
     args.push_back({ArgumentDescriptor::Types::INPUT, moe_gemm::MoEGemmInputIdx::INPUT});
     args.push_back({ArgumentDescriptor::Types::INPUT, moe_gemm::MoEGemmInputIdx::WEIGHT});
     args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
