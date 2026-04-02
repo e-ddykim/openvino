@@ -13,12 +13,13 @@
 namespace ov::intel_gpu::ocl {
 
 static size_t get_subgroup_size(gpu_arch arch) {
-    return arch >= gpu_arch::xe2 ? 32 : 16;
+    // return arch >= gpu_arch::xe2 ? 32 : 16;
+    return 16;
 }
 
 // Performance tuning parameters
-#define N_BLOCK      4
-#define SUBGROUP_NUM 8
+#define N_BLOCK      2
+#define SUBGROUP_NUM 16
 
 JitConstants MoEGemmDecodeGenerator::get_jit_constants(const RuntimeParams& params) const {
     auto jit = make_base_jit_constants(params);
@@ -151,6 +152,8 @@ DispatchDataFunc MoEGemmDecodeGenerator::get_dispatch_data_func() const {
 Arguments MoEGemmDecodeGenerator::get_arguments_desc(const kernel_impl_params& params) const {
     Arguments args;
     auto cfg = get_moe_cfg(params);
+    if (params.is_dynamic())
+        args.push_back({ArgumentDescriptor::Types::SHAPE_INFO, 0});
     args.push_back({ArgumentDescriptor::Types::INPUT, moe_gemm::MoEGemmInputIdx::INPUT});
     args.push_back({ArgumentDescriptor::Types::INPUT, moe_gemm::MoEGemmInputIdx::WEIGHT});
     args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
