@@ -339,6 +339,15 @@ KERNEL(moe_gemm_decode)(OPTIONAL_SHAPE_INFO_ARG
 
     __local float out_local_buf[N_BLOCK * num_sg];
     float out_private_buf[N_BLOCK] = {0.0f};
+    // half act_vals[K_BLOCK];
+    // uint act_idx = 0;
+    // for (uint idx_k = k_start; idx_k < k_end; idx_k += SUBGROUP_SIZE * 4) {
+    //     half4 act4 = as_half4(intel_sub_group_block_read2((const global uint*)input_ptr + idx_k / 2));
+    //     act_vals[act_idx++] = act4.s0;
+    //     act_vals[act_idx++] = act4.s1;
+    //     act_vals[act_idx++] = act4.s2;
+    //     act_vals[act_idx++] = act4.s3;
+    // }
 
 	for (uint idx_k = k_start; idx_k < k_end; idx_k += SUBGROUP_SIZE * 4) {
 		half4 act4 = as_half4(intel_sub_group_block_read2((const global uint*)input_ptr + idx_k / 2));
@@ -348,14 +357,34 @@ KERNEL(moe_gemm_decode)(OPTIONAL_SHAPE_INFO_ARG
             //         act4.s0, act4.s1, act4.s2, act4.s3);
             // }
 	
-		unroll_for (uint idx_n = n_start; idx_n < n_start + N_BLOCK; idx_n += 1) {
-            uchar2 w4 = intel_sub_group_block_read_uc2((const __global uchar*)weight + (idx_n * K + idx_k) / 2);
-            half2 ws2 = ((const __global half2*)scales)[(idx_n * NUM_GROUPS + idx_k / DOWN_GROUP_SIZE) / 2];
-			half dot0 = act4.s0 * UNPACK_LO(w4.s0);
-             dot0 = fma(act4.s1 , UNPACK_HI(w4.s0), dot0);
-            half dot1 = act4.s2 * UNPACK_LO(w4.s1);
-             dot1 = fma(act4.s3 , UNPACK_HI(w4.s1), dot1);
-            out_private_buf[idx_n - n_start] += dot0 * ws2.s0 + dot1 * ws2.s1;
+		for (uint idx_n = n_start; idx_n < n_start + N_BLOCK; idx_n += 2) {
+            uchar2 w4_0 = intel_sub_group_block_read_uc2((const __global uchar*)weight + (idx_n * K + idx_k) / 2);
+            uchar2 w4_1 = intel_sub_group_block_read_uc2((const __global uchar*)weight + ((idx_n + 1) * K + idx_k) / 2);
+            // uchar2 w4_2 = intel_sub_group_block_read_uc2((const __global uchar*)weight + (idx_n * K + k_start + SUBGROUP_SIZE * 8) / 2);
+            half2 ws2_0 = ((const __global half2*)scales)[(idx_n * NUM_GROUPS + idx_k / DOWN_GROUP_SIZE) / 2];
+            half2 ws2_1 = ((const __global half2*)scales)[((idx_n + 1) * NUM_GROUPS + idx_k / DOWN_GROUP_SIZE) / 2];
+            // half2 ws2_2 = ((const __global half2*)scales)[(idx_n * NUM_GROUPS + (k_start + SUBGROUP_SIZE * 8) / DOWN_GROUP_SIZE) / 2];
+
+			half dot0 = act4.s0 * UNPACK_LO(w4_0.s0);
+            dot0 = fma(act4.s1 , UNPACK_HI(w4_0.s0), dot0);
+            out_private_buf[idx_n - n_start] += dot0 * ws2_0.s0;
+
+            dot0 = act4.s2 * UNPACK_LO(w4_0.s1);
+            dot0 = fma(act4.s3 , UNPACK_HI(w4_0.s1), dot0);
+            out_private_buf[idx_n - n_start] += dot0 * ws2_0.s1;
+
+			half dot1 = act4.s0 * UNPACK_LO(w4_1.s0);
+            dot1 = fma(act4.s1 , UNPACK_HI(w4_1.s0), dot1);
+            out_private_buf[idx_n - n_start + 1] += dot1 * ws2_1.s0;
+            dot1 = act4.s2 * UNPACK_LO(w4_1.s1);
+            dot1 = fma(act4.s3 , UNPACK_HI(w4_1.s1), dot1);
+            out_private_buf[idx_n - n_start + 1] += dot1 * ws2_1.s1;
+
+            // sum_all = sub_group_reduce_add(sum_all);
+            // if (sglid == 0) {
+            //     out_local_buf[sgid * N_BLOCK + idx_n - n_start] = sum_all;
+            // }
+            // out_private_buf[idx_n - n_start] += dot0 * ws2.s0 + dot1 * ws2.s1;
 		}
     }
 
@@ -368,11 +397,11 @@ KERNEL(moe_gemm_decode)(OPTIONAL_SHAPE_INFO_ARG
     //         out_private_buf[4], out_private_buf[5], out_private_buf[6], out_private_buf[7]);
     // }
 
-    if (sglid == 0) {
-        for (uint idx_n = 0; idx_n < N_BLOCK; idx_n += 1) {
+    // if (sglid == 0) {
+        for (uint idx_n = sglid; idx_n < N_BLOCK; idx_n += SUBGROUP_SIZE) {
             out_local_buf[sgid * N_BLOCK + idx_n] = out_private_buf[idx_n];
         }
-    }
+    // }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 

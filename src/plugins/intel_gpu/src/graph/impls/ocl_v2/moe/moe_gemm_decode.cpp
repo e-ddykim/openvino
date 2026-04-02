@@ -19,7 +19,7 @@ static size_t get_subgroup_size(gpu_arch arch) {
 
 // Performance tuning parameters
 #define K_BLOCK      12
-#define N_BLOCK      64
+#define N_BLOCK      32
 // #define SUBGROUP_NUM 16
 
 JitConstants MoEGemmDecodeGenerator::get_jit_constants(const RuntimeParams& params) const {
