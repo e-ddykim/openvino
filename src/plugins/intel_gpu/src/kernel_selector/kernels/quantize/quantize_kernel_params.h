@@ -15,6 +15,7 @@ struct quantize_params : public base_params {
     : base_params(KernelType::QUANTIZE)
     , levels(0)
     , scale_shift_opt(false)
+    , output_round_to_even(false)
     , has_post_scale(true)
     , has_post_shift(true)
     , has_pre_shift(true)
@@ -38,6 +39,7 @@ struct quantize_params : public base_params {
 
     int levels;
     bool scale_shift_opt;
+    bool output_round_to_even;
     bool has_post_scale;
     bool has_post_shift;
     bool has_pre_shift;

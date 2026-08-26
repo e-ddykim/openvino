@@ -60,6 +60,7 @@ public:
 
         quantize_params.levels = arg.get_levels();
         quantize_params.scale_shift_opt = arg.get_scale_shift_opt();
+        quantize_params.output_round_to_even = arg.get_output_round_to_even();
         quantize_params.has_post_scale = arg.get_need_post_scale();
         quantize_params.has_post_shift = arg.get_need_post_shift();
         quantize_params.has_pre_shift = arg.get_need_pre_shift();

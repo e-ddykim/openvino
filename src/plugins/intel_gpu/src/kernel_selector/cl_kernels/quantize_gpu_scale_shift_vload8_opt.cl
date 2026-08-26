@@ -88,7 +88,14 @@ KERNEL(quantize_gpu_scale_shift_vload8_opt)(OPTIONAL_SHAPE_INFO_ARG
 #endif
     OUTPUT_VEC_TYPE res;
 #if HAS_CLAMP
-#if CAN_USE_OUTPUT_RANGE
+#if OUTPUT_ROUND_TO_EVEN
+    float dequantized_output_low_val  = (float)OUT_LO_VAL;
+    float dequantized_output_high_val = (float)OUT_HI_VAL;
+#if !CAN_USE_OUTPUT_RANGE
+    INPUT1_COMPUTE_TYPE input_low_val  = IN_LO_VAL;
+    INPUT1_COMPUTE_TYPE input_high_val = IN_HI_VAL;
+#endif
+#elif CAN_USE_OUTPUT_RANGE
     INPUT1_COMPUTE_TYPE output_low_val   = OUT_LO_VAL;
     INPUT1_COMPUTE_TYPE output_high_val  = OUT_HI_VAL;
 #else
@@ -109,6 +116,12 @@ KERNEL(quantize_gpu_scale_shift_vload8_opt)(OPTIONAL_SHAPE_INFO_ARG
     INPUT1_COMPUTE_VEC_TYPE val = TO_VECTOR_TYPE(INPUT1_COMPUTE_TYPE, 8)(DECODE_INPUT0_COMPUTE_VECTOR_TYPE(in0, 8)) * TO_INPUT1_COMPUTE_TYPE(IN_SCALE_VAL);
 #endif
 
+#if OUTPUT_ROUND_TO_EVEN
+#if HAS_POST_SHIFT
+    val += TO_INPUT1_COMPUTE_TYPE(OUT_SHIFT_VAL);
+#endif
+    val = rint(val);
+#else
 #if HAS_OUTPUT_RANGE_ROUND
     val = round(val);
 #endif
@@ -120,8 +133,9 @@ KERNEL(quantize_gpu_scale_shift_vload8_opt)(OPTIONAL_SHAPE_INFO_ARG
 #if HAS_POST_SHIFT
     val += TO_INPUT1_COMPUTE_TYPE(OUT_SHIFT_VAL);
 #endif
+#endif
 
-#if HAS_CLAMP
+#if HAS_CLAMP && !OUTPUT_ROUND_TO_EVEN
 #if HAS_MIN_CLAMP && HAS_MAX_CLAMP
     val = clamp(val, output_low_val, output_high_val);
 #elif HAS_MIN_CLAMP
@@ -144,22 +158,57 @@ KERNEL(quantize_gpu_scale_shift_vload8_opt)(OPTIONAL_SHAPE_INFO_ARG
 #endif
 
 #if HAS_PRE_SHIFT
+#if OUTPUT_ROUND_TO_EVEN
+    val = val * TO_INPUT1_COMPUTE_TYPE(IN_SCALE_VAL) + TO_INPUT1_COMPUTE_TYPE(IN_SHIFT_VAL);
+#else
     val = round(val * TO_INPUT1_COMPUTE_TYPE(IN_SCALE_VAL) + TO_INPUT1_COMPUTE_TYPE(IN_SHIFT_VAL));
+#endif
+#else
+#if OUTPUT_ROUND_TO_EVEN
+    val *= TO_INPUT1_COMPUTE_TYPE(IN_SCALE_VAL);
 #else
     val = round(val * TO_INPUT1_COMPUTE_TYPE(IN_SCALE_VAL));
 #endif
+#endif
 
-#if HAS_POST_SCALE
+#if OUTPUT_ROUND_TO_EVEN
+#if HAS_POST_SHIFT
+    val += TO_INPUT1_COMPUTE_TYPE(OUT_SHIFT_VAL);
+#endif
+    val = rint(val);
+#endif
+
+#if HAS_POST_SCALE && !OUTPUT_ROUND_TO_EVEN
     val *= TO_INPUT1_COMPUTE_TYPE(OUT_SCALE_VAL);
 #endif
 
+#if !OUTPUT_ROUND_TO_EVEN
 #if HAS_POST_SHIFT
     val += TO_INPUT1_COMPUTE_TYPE(OUT_SHIFT_VAL);
+#endif
 #endif
 
 #endif // CAN_USE_OUTPUT_RANGE
 
-#if OUTPUT_IS_FP
+#if OUTPUT_ROUND_TO_EVEN
+    float8 dequantized_val = convert_float8(val);
+#if HAS_POST_SCALE
+    dequantized_val *= (float)OUT_SCALE_VAL;
+#endif
+#if HAS_CLAMP
+#if HAS_MIN_CLAMP && HAS_MAX_CLAMP
+    dequantized_val = clamp(dequantized_val, dequantized_output_low_val, dequantized_output_high_val);
+#elif HAS_MIN_CLAMP
+    dequantized_val = max(dequantized_val, dequantized_output_low_val);
+#else // HAS_MAX_CLAMP
+    dequantized_val = min(dequantized_val, dequantized_output_high_val);
+#endif
+#endif // HAS_CLAMP
+#endif // OUTPUT_ROUND_TO_EVEN
+
+#if OUTPUT_ROUND_TO_EVEN
+        res = TO_OUTPUT_VECTOR_TYPE_SAT(dequantized_val, 8);
+#elif OUTPUT_IS_FP
         res = TO_OUTPUT_VECTOR_TYPE_SAT(val, 8);
 #else
         res = TO_VECTOR_TYPE_SAT_RTE(OUTPUT_TYPE, 8)(val);;

@@ -10,6 +10,7 @@
 #include "pooling_inst.h"
 #include "quantize_inst.h"
 #include "reorder_inst.h"
+#include "reshape_inst.h"
 #include "eltwise_inst.h"
 #include "data_inst.h"
 #include "pass_manager.h"
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <string>
 #include <memory>
 #include <tuple>
@@ -346,6 +348,100 @@ void prepare_quantization::handle_quantize_node(program& p, quantize_node& quant
     if (l > 2 && l <= 256 && !quantize_node.get_scale_shift_opt()) {
         prepare_scale_shift_opt(p, quantize_node);
     }
+}
+
+bool prepare_quantization::fuse_dequantize(program& p, eltwise_node& eltwise_node) {
+    const auto eltwise_prim = eltwise_node.get_primitive();
+    if (eltwise_node.is_output() || eltwise_node.get_dependencies().size() != 2 || eltwise_prim->mode != eltwise_mode::prod || !eltwise_prim->stride.empty()) {
+        return false;
+    }
+
+    quantize_node* quantize_candidate = nullptr;
+    program_node* scale_candidate = nullptr;
+    data_node* scale_node = nullptr;
+    reshape_node* scale_reshape = nullptr;
+    for (const auto& dependency : eltwise_node.get_dependencies()) {
+        if (dependency.first->is_type<quantize>()) {
+            quantize_candidate = &dependency.first->as<quantize>();
+        } else {
+            scale_candidate = dependency.first;
+        }
+    }
+
+    if (scale_candidate != nullptr && scale_candidate->is_type<data>()) {
+        scale_node = &scale_candidate->as<data>();
+    } else if (scale_candidate != nullptr && scale_candidate->is_type<reshape>()) {
+        scale_reshape = &scale_candidate->as<reshape>();
+        if (scale_reshape->is_output() || scale_reshape->get_users().size() != 1 || scale_reshape->get_dependencies().size() != 1 ||
+            !scale_reshape->get_dependency(0).is_type<data>() || scale_reshape->get_output_layout().count() != 1 ||
+            scale_reshape->get_dependency(0).get_output_layout().count() != 1) {
+            return false;
+        }
+        scale_node = &scale_reshape->get_dependency(0).as<data>();
+    }
+
+    if (quantize_candidate == nullptr || scale_candidate == nullptr || scale_node == nullptr || quantize_candidate->get_users().size() != 1 ||
+        quantize_candidate->get_dependencies().size() != 9 || !quantize_candidate->get_scale_shift_opt() || quantize_candidate->get_output_round_to_even()) {
+        return false;
+    }
+
+    const auto quantize_layout = quantize_candidate->get_output_layout();
+    const auto eltwise_layout = eltwise_node.get_output_layout();
+    const auto scale_layout = scale_candidate->get_output_layout();
+    const auto quantize_param_type = quantize_candidate->get_input_layout(1).data_type;
+    if (quantize_layout.data_type != data_types::i8 || eltwise_layout.data_type != data_types::f16 || quantize_layout.format != eltwise_layout.format ||
+        quantize_layout.get_partial_shape() != eltwise_layout.get_partial_shape() || scale_layout.count() != 1 ||
+        scale_layout.data_type != data_types::f32 || (quantize_param_type != data_types::f16 && quantize_param_type != data_types::f32)) {
+        return false;
+    }
+
+    if (quantize_candidate->get_levels() != 256 || quantize_candidate->get_need_post_scale() || quantize_candidate->get_need_clamp() ||
+        !quantize_candidate->get_per_tensor_output_range() || !quantize_candidate->get_per_tensor_output_scale() ||
+        (quantize_candidate->get_need_post_shift() && !quantize_candidate->get_per_tensor_output_shift()) ||
+        quantize_candidate->get_output_lo_val() != -128.0f || quantize_candidate->get_output_hi_val() != 127.0f ||
+        quantize_candidate->get_output_scale_val() != 1.0f) {
+        return false;
+    }
+
+    const auto scale_memory = scale_node->get_attached_memory_ptr();
+    mem_lock<float, mem_lock_type::read> scale_lock{scale_memory, p.get_stream()};
+    const auto scale = scale_lock[0];
+
+    const auto output_low = quantize_candidate->get_output_lo_val() * scale;
+    const auto output_high = quantize_candidate->get_output_hi_val() * scale;
+    const auto output_scale = quantize_candidate->get_output_scale_val() * scale;
+    if (!(scale > 0.0f) || !std::isfinite(scale) || !std::isfinite(output_low) || !std::isfinite(output_high) || !std::isfinite(output_scale) ||
+        !std::isfinite(quantize_candidate->get_output_shift_val())) {
+        return false;
+    }
+
+    auto quantize_prim = quantize_candidate->get_primitive()->typed_clone();
+    quantize_prim->id += "_dequantized";
+    quantize_prim->output_data_types = {optional_data_type{data_types::f16}};
+    quantize_prim->output_round_to_even = true;
+    quantize_prim->need_post_scale = output_scale != 1.0f;
+    quantize_prim->need_clamp = true;
+    quantize_prim->need_min_clamp = true;
+    quantize_prim->need_max_clamp = true;
+    quantize_prim->out_lo = output_low;
+    quantize_prim->out_hi = output_high;
+    quantize_prim->out_scale = output_scale;
+
+    auto& fused_quantize_node = p.get_or_create(quantize_prim);
+    p.replace(*quantize_candidate, fused_quantize_node);
+    fused_quantize_node.recalc_output_layout(false);
+
+    const auto eltwise_id = eltwise_node.id();
+    p.replace_all_usages(eltwise_node, fused_quantize_node);
+    p.add_optimized_primitive_info(eltwise_id, {fused_quantize_node.id()});
+    p.remove_all_connections(eltwise_node);
+    p.remove_if_dangling(eltwise_node);
+    if (scale_reshape != nullptr) {
+        p.remove_all_connections(*scale_reshape);
+        p.remove_if_dangling(*scale_reshape);
+    }
+    p.remove_if_dangling(*scale_node);
+    return true;
 }
 
 void prepare_quantization::prepare_dequantize_merge(program& p, eltwise_node& eltwise_node) {
@@ -691,7 +787,8 @@ void prepare_quantization::run(program& p) {
         if (node->is_type<quantize>()) {
             handle_quantize_node(p, node->as<quantize>());
         } else if (node->is_type<eltwise>()) {
-            prepare_dequantize_merge(p, node->as<eltwise>());
+            if (!fuse_dequantize(p, node->as<eltwise>()))
+                prepare_dequantize_merge(p, node->as<eltwise>());
         } else if (node->is_type<reorder>()) {
             remove_fake_reorders(p, node->as<reorder>());
         } else if (node->is_type<fully_connected>()) {

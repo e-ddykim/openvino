@@ -112,6 +112,7 @@ JitConstants QuantizeKernelScaleShift::GetJitConstants(const quantize_params& pa
     jit.AddConstant(MakeJitConstant("OUT_SHIFT_VAL", params.out_shift));
     jit.AddConstant(MakeJitConstant("CAN_USE_OUTPUT_RANGE", can_use_output_range));
     jit.AddConstant(MakeJitConstant("HAS_OUTPUT_RANGE_ROUND", has_output_range_round));
+    jit.AddConstant(MakeJitConstant("OUTPUT_ROUND_TO_EVEN", params.output_round_to_even));
 
     return jit;
 }

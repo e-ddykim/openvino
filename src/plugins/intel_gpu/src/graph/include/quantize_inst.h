@@ -171,6 +171,7 @@ public:
     program_node& input(size_t index = 0) const { return get_dependency(index); }
     int get_levels() const { return get_primitive()->levels; }
     bool get_scale_shift_opt() const { return get_primitive()->scale_shift_opt; }
+    bool get_output_round_to_even() const { return get_primitive()->output_round_to_even; }
     bool get_need_pre_shift() const { return get_primitive()->need_pre_shift; }
     bool get_need_post_scale() const { return get_primitive()->need_post_scale; }
     bool get_need_post_shift() const { return get_primitive()->need_post_shift; }

@@ -22,7 +22,11 @@
 #include <ov_ops/type_relaxed.hpp>
 
 #include "common_test_utils/ov_test_utils.hpp"
+#include "low_precision/add.hpp"
+#include "low_precision/low_precision.hpp"
+#include "low_precision/variadic_split.hpp"
 #include "transformations/rt_info/decompression.hpp"
+#include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
@@ -30,10 +34,134 @@
 #include "openvino/op/subtract.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/variadic_split.hpp"
 #include "intel_gpu/op/fully_connected_compressed.hpp"
 
 using namespace testing;
 using namespace ov::intel_gpu;
+
+namespace {
+
+std::shared_ptr<ov::opset1::MatMul> make_lpt_matmul(const ov::Output<ov::Node>& input) {
+    auto weights = ov::opset1::Constant::create(ov::element::i8, ov::Shape{4, 12}, {1});
+    return std::make_shared<ov::op::TypeRelaxed<ov::opset1::MatMul>>(ov::element::TypeVector{ov::element::f32, ov::element::f32},
+                                                                     ov::element::TypeVector{ov::element::f32},
+                                                                     ov::op::TemporaryReplaceOutputType(input, ov::element::f32).get(),
+                                                                     ov::op::TemporaryReplaceOutputType(weights, ov::element::f32).get(),
+                                                                     false,
+                                                                     false);
+}
+
+std::shared_ptr<ov::Model> make_split_bias_model(bool additional_consumer = false, bool scalar_bias = false, bool split_non_last_axis = false) {
+    auto input = std::make_shared<ov::opset1::Parameter>(ov::element::i8, ov::Shape{2, 3, 4});
+    auto matmul = make_lpt_matmul(input);
+    auto scale = ov::opset1::Constant::create(ov::element::f32, ov::Shape{1, 1, 12}, {0.5f});
+    auto multiply = std::make_shared<ov::opset1::Multiply>(matmul, scale);
+
+    const int64_t axis_value = split_non_last_axis ? 1 : -1;
+    const std::vector<int64_t> split_lengths = split_non_last_axis ? std::vector<int64_t>{1, 1, 1} : std::vector<int64_t>{3, 4, 5};
+    auto axis = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {axis_value});
+    auto lengths = ov::opset1::Constant::create(ov::element::i64, ov::Shape{3}, split_lengths);
+    auto split = std::make_shared<ov::opset1::VariadicSplit>(multiply, axis, lengths);
+
+    ov::OutputVector outputs;
+    for (size_t i = 0; i < split_lengths.size(); ++i) {
+        const auto channels = split_non_last_axis || (scalar_bias && i == 1) ? 1 : split_lengths[i];
+        auto bias = ov::opset1::Constant::create(ov::element::f32, ov::Shape{1, 1, static_cast<size_t>(channels)}, {static_cast<float>(i + 1)});
+        outputs.push_back(std::make_shared<ov::opset1::Add>(bias, split->output(i)));
+    }
+    if (additional_consumer) {
+        outputs.push_back(split->output(0));
+    }
+
+    return std::make_shared<ov::Model>(outputs, ov::ParameterVector{input});
+}
+
+std::shared_ptr<ov::Model> make_split_bias_reference() {
+    auto input = std::make_shared<ov::opset1::Parameter>(ov::element::i8, ov::Shape{2, 3, 4});
+    auto matmul = make_lpt_matmul(input);
+    auto scale = ov::opset1::Constant::create(ov::element::f32, ov::Shape{1, 1, 12}, {0.5f});
+    auto multiply = std::make_shared<ov::opset1::Multiply>(matmul, scale);
+
+    ov::OutputVector biases;
+    const std::vector<int64_t> split_lengths{3, 4, 5};
+    for (size_t i = 0; i < split_lengths.size(); ++i) {
+        biases.push_back(ov::opset1::Constant::create(ov::element::f32, ov::Shape{1, 1, static_cast<size_t>(split_lengths[i])}, {static_cast<float>(i + 1)}));
+    }
+    auto merged_bias = std::make_shared<ov::opset1::Concat>(biases, 2);
+    auto merged_add = std::make_shared<ov::opset1::Add>(merged_bias, multiply);
+    auto axis = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {-1});
+    auto lengths = ov::opset1::Constant::create(ov::element::i64, ov::Shape{3}, split_lengths);
+    auto split = std::make_shared<ov::opset1::VariadicSplit>(merged_add, axis, lengths);
+
+    return std::make_shared<ov::Model>(split->outputs(), ov::ParameterVector{input});
+}
+
+std::shared_ptr<ov::Model> make_lpt_propagated_split_reference() {
+    auto input = std::make_shared<ov::opset1::Parameter>(ov::element::i8, ov::Shape{2, 3, 4});
+    auto matmul = make_lpt_matmul(input);
+    const std::vector<int64_t> split_lengths{3, 4, 5};
+    auto axis = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {-1});
+    auto lengths = ov::opset1::Constant::create(ov::element::i64, ov::Shape{3}, split_lengths);
+    auto split = std::make_shared<ov::opset1::VariadicSplit>(matmul, axis, lengths);
+
+    ov::OutputVector outputs;
+    for (size_t i = 0; i < split_lengths.size(); ++i) {
+        const auto channels = i == 1 ? 1 : split_lengths[i];
+        auto scale = ov::opset1::Constant::create(ov::element::f32, ov::Shape{}, {0.5f});
+        auto multiply = std::make_shared<ov::opset1::Multiply>(split->output(i), scale);
+        auto bias = ov::opset1::Constant::create(ov::element::f32,
+                                                 ov::Shape{1, 1, static_cast<size_t>(channels)},
+                                                 {static_cast<float>(i + 1)});
+        outputs.push_back(std::make_shared<ov::opset1::Add>(bias, multiply));
+    }
+
+    return std::make_shared<ov::Model>(outputs, ov::ParameterVector{input});
+}
+
+}  // namespace
+
+TEST_F(TransformationTestsF, MoveAddBeforeVariadicSplit_LPTCallbackAndPassOrder) {
+    model = make_split_bias_model();
+    model_ref = make_split_bias_reference();
+    manager.get_pass_config()->set_callback<ov::pass::low_precision::VariadicSplitTransformation>(
+        [](const std::shared_ptr<const ov::Node>& node) {
+            return MoveAddBeforeVariadicSplit::can_be_transformed(node);
+        });
+    manager.register_pass<ov::pass::low_precision::LowPrecision>();
+    manager.register_pass<MoveAddBeforeVariadicSplit>();
+    comparator.enable(FunctionsComparator::CmpValues::CONST_VALUES);
+    comparator.enable(FunctionsComparator::CmpValues::ATTRIBUTES);
+}
+
+TEST_F(TransformationTestsF, MoveAddBeforeVariadicSplit_NonTargetAllowsLPTPropagation) {
+    model = make_split_bias_model(false, true);
+    model_ref = make_lpt_propagated_split_reference();
+    manager.get_pass_config()->set_callback<ov::pass::low_precision::VariadicSplitTransformation>(
+        [](const std::shared_ptr<const ov::Node>& node) {
+            return MoveAddBeforeVariadicSplit::can_be_transformed(node);
+        });
+    manager.get_pass_config()->disable<ov::pass::low_precision::AddTransformation>();
+    manager.register_pass<ov::pass::low_precision::LowPrecision>();
+    manager.register_pass<MoveAddBeforeVariadicSplit>();
+    comparator.enable(FunctionsComparator::CmpValues::CONST_VALUES);
+    comparator.enable(FunctionsComparator::CmpValues::ATTRIBUTES);
+}
+
+TEST_F(TransformationTestsF, MoveAddBeforeVariadicSplit_AdditionalConsumer_NoChange) {
+    model = make_split_bias_model(true);
+    manager.register_pass<MoveAddBeforeVariadicSplit>();
+}
+
+TEST_F(TransformationTestsF, MoveAddBeforeVariadicSplit_ScalarBias_NoChange) {
+    model = make_split_bias_model(false, true);
+    manager.register_pass<MoveAddBeforeVariadicSplit>();
+}
+
+TEST_F(TransformationTestsF, MoveAddBeforeVariadicSplit_NonLastAxis_NoChange) {
+    model = make_split_bias_model(false, false, true);
+    manager.register_pass<MoveAddBeforeVariadicSplit>();
+}
 
 TEST_F(TransformationTestsF, ConvertMatMulToFullyConnectedTest1) {
     {

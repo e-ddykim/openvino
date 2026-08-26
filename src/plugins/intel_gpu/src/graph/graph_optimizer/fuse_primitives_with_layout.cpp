@@ -35,6 +35,8 @@ void fuse_primitives_with_layout::run(program& p) {
         // Check fusing quantize to eltwise for this case
         auto func_fuse_quantize = [&](quantize_node& node) {
             bool should_fuse = false;
+            if (node.get_output_round_to_even())
+                return;
             auto out_layout = node.get_output_layout();
             if (out_layout.is_dynamic() || node.is_in_shape_of_subgraph())
                 return;

@@ -9,11 +9,15 @@
 #include "intel_gpu/op/fully_connected.hpp"
 #include "intel_gpu/op/placeholder.hpp"
 #include "convert_matmul_to_fc.hpp"
+#include "openvino/op/add.hpp"
+#include "openvino/op/concat.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/variadic_split.hpp"
 #include "openvino/core/rt_info.hpp"
+#include "openvino/core/shape.hpp"
 #include "openvino/pass/constant_folding.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 #include "transformations/rt_info/decompression.hpp"
@@ -25,6 +29,163 @@
 #include "compressed_weights_pattern.hpp"
 
 namespace ov::intel_gpu {
+
+bool MoveAddBeforeVariadicSplit::can_be_transformed(const std::shared_ptr<const ov::Node>& node) {
+    const auto split = ov::as_type_ptr<const ov::op::v1::VariadicSplit>(node);
+    if (!split || split->get_output_size() < 2) {
+        return false;
+    }
+
+    const auto multiply = ov::as_type_ptr<const ov::op::v1::Multiply>(split->get_input_node_shared_ptr(0));
+    if (!multiply || multiply->get_output_target_inputs(0).size() != 1) {
+        return false;
+    }
+
+    const bool first_input_is_constant = ov::is_type<ov::op::v0::Constant>(multiply->get_input_node_shared_ptr(0));
+    const bool second_input_is_constant = ov::is_type<ov::op::v0::Constant>(multiply->get_input_node_shared_ptr(1));
+    if (first_input_is_constant == second_input_is_constant) {
+        return false;
+    }
+
+    const size_t scale_input_idx = first_input_is_constant ? 0 : 1;
+    const size_t data_input_idx = 1 - scale_input_idx;
+    const auto matmul = ov::as_type_ptr<const ov::op::v0::MatMul>(multiply->get_input_node_shared_ptr(data_input_idx));
+    if (!matmul || matmul->get_output_target_inputs(0).size() != 1) {
+        return false;
+    }
+
+    const auto input_shape = split->get_input_partial_shape(0);
+    if (!input_shape.is_static() || input_shape.rank().get_length() == 0) {
+        return false;
+    }
+
+    const auto axis_constant = ov::as_type_ptr<const ov::op::v0::Constant>(split->get_input_node_shared_ptr(1));
+    const auto lengths_constant = ov::as_type_ptr<const ov::op::v0::Constant>(split->get_input_node_shared_ptr(2));
+    if (!axis_constant || ov::shape_size(axis_constant->get_shape()) != 1 || !lengths_constant ||
+        ov::shape_size(lengths_constant->get_shape()) != split->get_output_size()) {
+        return false;
+    }
+
+    const auto rank = input_shape.size();
+    auto axis = axis_constant->cast_vector<int64_t>()[0];
+    axis = axis < 0 ? axis + static_cast<int64_t>(rank) : axis;
+    if (axis != static_cast<int64_t>(rank - 1)) {
+        return false;
+    }
+
+    const auto normalized_axis = static_cast<size_t>(axis);
+    const auto input_static_shape = input_shape.to_shape();
+    const auto has_per_channel_shape = [rank, normalized_axis](const ov::Shape& shape, size_t channels) {
+        if (shape.size() != rank || shape[normalized_axis] != channels) {
+            return false;
+        }
+        for (size_t i = 0; i < rank; ++i) {
+            if (i != normalized_axis && shape[i] != 1) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto scale = ov::as_type_ptr<const ov::op::v0::Constant>(multiply->get_input_node_shared_ptr(scale_input_idx));
+    if (!scale || !has_per_channel_shape(scale->get_shape(), input_static_shape[normalized_axis])) {
+        return false;
+    }
+
+    ov::element::Type bias_type = ov::element::dynamic;
+    for (size_t i = 0; i < split->get_output_size(); ++i) {
+        const auto output = split->output(i);
+        const auto& target_inputs = output.get_target_inputs();
+        if (target_inputs.size() != 1 || !output.get_partial_shape().is_static()) {
+            return false;
+        }
+
+        const auto add = ov::as_type_ptr<const ov::op::v1::Add>(target_inputs.begin()->get_node()->shared_from_this());
+        if (!add || add->get_autob().m_type != ov::op::AutoBroadcastType::NUMPY) {
+            return false;
+        }
+
+        const auto data_input_idx = target_inputs.begin()->get_index();
+        if (data_input_idx > 1) {
+            return false;
+        }
+        const auto bias_input_idx = 1 - data_input_idx;
+
+        const auto bias = ov::as_type_ptr<const ov::op::v0::Constant>(add->get_input_node_shared_ptr(bias_input_idx));
+        const auto output_shape = output.get_shape();
+        if (!bias || !has_per_channel_shape(bias->get_shape(), output_shape[normalized_axis])) {
+            return false;
+        }
+
+        if (bias_type == ov::element::dynamic) {
+            bias_type = bias->get_element_type();
+        } else if (bias_type != bias->get_element_type()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+MoveAddBeforeVariadicSplit::MoveAddBeforeVariadicSplit() {
+    using namespace ov::pass::pattern;
+
+    auto split_pattern =
+        wrap_type<ov::op::v1::VariadicSplit>({wrap_type<ov::op::v1::Multiply>(), wrap_type<ov::op::v0::Constant>(), wrap_type<ov::op::v0::Constant>()});
+
+    ov::matcher_pass_callback callback = [OV_CAPTURE_CPY_AND_THIS](ov::pass::pattern::Matcher& m) {
+        const auto split = ov::as_type_ptr<ov::op::v1::VariadicSplit>(m.get_match_root());
+        if (!split || transformation_callback(split) || !can_be_transformed(split)) {
+            return false;
+        }
+
+        const auto axis = ov::as_type_ptr<ov::op::v0::Constant>(split->get_input_node_shared_ptr(1))->cast_vector<int64_t>()[0];
+        const auto normalized_axis = axis < 0 ? axis + static_cast<int64_t>(split->get_input_partial_shape(0).size()) : axis;
+
+        ov::NodeVector add_nodes;
+        ov::NodeVector bias_nodes;
+        ov::OutputVector biases;
+        size_t first_add_data_input_idx = 0;
+        for (size_t i = 0; i < split->get_output_size(); ++i) {
+            const auto output = split->output(i);
+            const auto& target_inputs = output.get_target_inputs();
+            const auto add = ov::as_type_ptr<ov::op::v1::Add>(target_inputs.begin()->get_node()->shared_from_this());
+            const size_t data_input_idx = target_inputs.begin()->get_index();
+            const size_t bias_input_idx = 1 - data_input_idx;
+            if (i == 0) {
+                first_add_data_input_idx = data_input_idx;
+            }
+            add_nodes.push_back(add);
+            bias_nodes.push_back(add->get_input_node_shared_ptr(bias_input_idx));
+            biases.push_back(add->input_value(bias_input_idx));
+        }
+
+        const auto merged_bias = std::make_shared<ov::op::v0::Concat>(biases, normalized_axis);
+        merged_bias->set_friendly_name(split->get_friendly_name() + "/merged_bias");
+        ov::copy_runtime_info(bias_nodes, merged_bias);
+
+        auto merged_add_inputs = add_nodes.front()->input_values();
+        merged_add_inputs[first_add_data_input_idx] = split->input_value(0);
+        merged_add_inputs[1 - first_add_data_input_idx] = merged_bias;
+        const auto merged_add = add_nodes.front()->clone_with_new_inputs(merged_add_inputs);
+        merged_add->set_friendly_name(split->get_friendly_name() + "/merged_add");
+        ov::copy_runtime_info(add_nodes, merged_add);
+
+        auto new_split_inputs = split->input_values();
+        new_split_inputs[0] = merged_add;
+        const auto new_split = split->clone_with_new_inputs(new_split_inputs);
+        new_split->set_friendly_name(split->get_friendly_name());
+        ov::copy_runtime_info(split, new_split);
+
+        for (size_t i = 0; i < split->get_output_size(); ++i) {
+            ov::replace_output_update_name(add_nodes[i]->output(0), new_split->output(i));
+        }
+        return true;
+    };
+
+    auto matcher = std::make_shared<ov::pass::pattern::Matcher>(split_pattern, "MoveAddBeforeVariadicSplit");
+    this->register_matcher(matcher, callback);
+}
 
 ConvertMatMulToFullyConnected::ConvertMatMulToFullyConnected(bool supports_immad) {
     using namespace ov::pass::pattern;

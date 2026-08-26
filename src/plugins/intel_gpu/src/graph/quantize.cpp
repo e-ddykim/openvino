@@ -33,6 +33,7 @@ std::string quantize_inst::to_string(quantize_node const& node) {
     auto& output_low = node.input(3);
     auto& output_high = node.input(4);
     const auto* scale_shift_opt = node.get_scale_shift_opt() ? "true" : "false";
+    const auto* output_round_to_even = node.get_output_round_to_even() ? "true" : "false";
 
     std::stringstream primitive_description;
 
@@ -43,6 +44,7 @@ std::string quantize_inst::to_string(quantize_node const& node) {
     quantize_info.add("output low id", output_low.id());
     quantize_info.add("output high id", output_high.id());
     quantize_info.add("scale_shift_opt", scale_shift_opt);
+    quantize_info.add("output_round_to_even", output_round_to_even);
     quantize_info.add("levels", desc->levels);
 
     node_info->add("quantize info", quantize_info);

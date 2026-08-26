@@ -38,6 +38,7 @@
 #include "low_precision/recurrent_cell.hpp"
 #include "low_precision/prelu.hpp"
 #include "low_precision/transpose.hpp"
+#include "low_precision/variadic_split.hpp"
 #include "openvino/core/type.hpp"
 #include "openvino/core/type/element_type.hpp"
 #include "openvino/core/validation_util.hpp"
@@ -1364,6 +1365,9 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         lptPassConfig->disable<ov::pass::low_precision::RecurrentCellTransformation>();
         // Ticket 168015: Low precision PRelu is not supported on GPU
         lptPassConfig->disable<ov::pass::low_precision::PReluTransformation>();
+        lptPassConfig->set_callback<VariadicSplitTransformation>([](const_node_ptr& node) -> bool {
+            return ov::intel_gpu::MoveAddBeforeVariadicSplit::can_be_transformed(node);
+        });
         lptPassConfig->set_callback<ConvolutionBackpropDataTransformation>([func, defaultPrecisions](const_node_ptr& node) -> bool {
             auto fillStaticChannel = [func](const ov::PartialShape& shape, size_t& channel) -> bool {
                 const auto rank = shape.rank();
@@ -1468,6 +1472,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             reshapeIgnorePerTensorQuantizationCheck = true;
         auto params = LayerTransformation::Params(true, element::f32, defaultPrecisions, reshapeIgnorePerTensorQuantizationCheck);
         lptManager.register_pass<LowPrecision>(supportedPrecisions, perTensorQuantization, params);
+        lptManager.register_pass<ov::intel_gpu::MoveAddBeforeVariadicSplit>();
         lptManager.run_passes(func);
     }
 

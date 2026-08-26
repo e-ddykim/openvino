@@ -135,6 +135,7 @@ public:
 private:
     void run(program& p) override;
     void handle_quantize_node(program& p, quantize_node& quantize_node);
+    bool fuse_dequantize(program& p, eltwise_node& eltwise_node);
     void prepare_dequantize_merge(program& p, eltwise_node& eltwise_node);
     void remove_fake_reorders(program& p, reorder_node& reorder_node);
     void prepare_scale_shift_opt(program& p, quantize_node& quantize_node);

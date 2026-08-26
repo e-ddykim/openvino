@@ -8,6 +8,14 @@
 
 namespace ov::intel_gpu {
 
+class MoveAddBeforeVariadicSplit : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("MoveAddBeforeVariadicSplit");
+    MoveAddBeforeVariadicSplit();
+
+    static bool can_be_transformed(const std::shared_ptr<const ov::Node>& node);
+};
+
 class ConvertMatMulToFullyConnected: public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ConvertMatMulToFullyConnected");

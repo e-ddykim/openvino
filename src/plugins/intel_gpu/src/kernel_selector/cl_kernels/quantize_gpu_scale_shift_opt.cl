@@ -143,9 +143,17 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 #endif
 
 #if PER_TENSOR_OUTPUT_SCALE
+#if OUTPUT_ROUND_TO_EVEN
+    float output_scale_val = (float)OUT_SCALE_VAL;
+#else
     INPUT1_COMPUTE_TYPE output_scale_val = OUT_SCALE_VAL;
+#endif
+#else
+#if OUTPUT_ROUND_TO_EVEN
+    float output_scale_val = convert_float(output_scale[scales_offset]);
 #else
     INPUT1_COMPUTE_TYPE output_scale_val = output_scale[scales_offset];
+#endif
 #endif
 
 #if PER_TENSOR_OUTPUT_SHIFT
@@ -155,7 +163,14 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 #endif
 
 #if HAS_CLAMP
-#if CAN_USE_OUTPUT_RANGE
+#if OUTPUT_ROUND_TO_EVEN
+    float dequantized_output_low_val  = (float)OUT_LO_VAL;
+    float dequantized_output_high_val = (float)OUT_HI_VAL;
+#if !CAN_USE_OUTPUT_RANGE
+    INPUT1_COMPUTE_TYPE input_low_val  = IN_LO_VAL;
+    INPUT1_COMPUTE_TYPE input_high_val = IN_HI_VAL;
+#endif
+#elif CAN_USE_OUTPUT_RANGE
     INPUT1_COMPUTE_TYPE output_low_val   = OUT_LO_VAL;
     INPUT1_COMPUTE_TYPE output_high_val  = OUT_HI_VAL;
 #else
@@ -181,6 +196,12 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
     INPUT1_COMPUTE_TYPE val = TO_INPUT1_COMPUTE_TYPE(DECODE_INPUT0_COMPUTE_TYPE(input[input_offset])) * input_scale_val;
 #endif
 
+#if OUTPUT_ROUND_TO_EVEN
+#if HAS_POST_SHIFT
+    val += output_shift_val;
+#endif
+    val = rint(val);
+#else
 #if HAS_OUTPUT_RANGE_ROUND
     val = round(val);
 #endif
@@ -192,8 +213,9 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 #if HAS_POST_SHIFT
     val += output_shift_val;
 #endif
+#endif
 
-#if HAS_CLAMP
+#if HAS_CLAMP && !OUTPUT_ROUND_TO_EVEN
 #if HAS_MIN_CLAMP && HAS_MAX_CLAMP
     val = clamp(val, output_low_val, output_high_val);
 #elif HAS_MIN_CLAMP
@@ -216,26 +238,61 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 #endif
 
 #if HAS_PRE_SHIFT
+#if OUTPUT_ROUND_TO_EVEN
+    val = val * input_scale_val + input_shift_val;
+#else
     val = round(val * input_scale_val + input_shift_val);
+#endif
+#else
+#if OUTPUT_ROUND_TO_EVEN
+    val *= input_scale_val;
 #else
     val = round(val * input_scale_val);
 #endif
-
-#if HAS_POST_SCALE
-    val *= output_scale_val;
 #endif
 
+#if OUTPUT_ROUND_TO_EVEN
 #if HAS_POST_SHIFT
     val += output_shift_val;
 #endif
+    val = rint(val);
+#endif
+
+#if HAS_POST_SCALE && !OUTPUT_ROUND_TO_EVEN
+    val *= output_scale_val;
+#endif
+
+#if !OUTPUT_ROUND_TO_EVEN
+#if HAS_POST_SHIFT
+    val += output_shift_val;
+#endif
+#endif
 
 #endif // CAN_USE_OUTPUT_RANGE
+
+#if OUTPUT_ROUND_TO_EVEN
+    float dequantized_val = convert_float(val);
+#if HAS_POST_SCALE
+    dequantized_val *= output_scale_val;
+#endif
+#if HAS_CLAMP
+#if HAS_MIN_CLAMP && HAS_MAX_CLAMP
+    dequantized_val = clamp(dequantized_val, dequantized_output_low_val, dequantized_output_high_val);
+#elif HAS_MIN_CLAMP
+    dequantized_val = max(dequantized_val, dequantized_output_low_val);
+#else // HAS_MAX_CLAMP
+    dequantized_val = min(dequantized_val, dequantized_output_high_val);
+#endif
+#endif // HAS_CLAMP
+#endif // OUTPUT_ROUND_TO_EVEN
 
 // *********************************** //
 // Common section with results writing //
 // *********************************** //
 
-#if OUTPUT_IS_FP
+#if OUTPUT_ROUND_TO_EVEN
+        output[output_offset] = TO_OUTPUT_TYPE_SAT(dequantized_val);
+#elif OUTPUT_IS_FP
         output[output_offset] = TO_OUTPUT_TYPE_SAT(val);
 #else
         output[output_offset] = TO_OUTPUT_TYPE_SAT_RTE(val);

@@ -40,6 +40,8 @@ struct quantize : public primitive_base<quantize> {
     int levels;
 
     bool scale_shift_opt = false;
+    // Apply output shift and RTE before post-scale to emulate an integer Quantize followed by dequantization.
+    bool output_round_to_even = false;
     bool need_post_scale = false;
     bool need_post_shift = false;
     bool need_pre_shift = false;
@@ -67,6 +69,7 @@ struct quantize : public primitive_base<quantize> {
         size_t seed = primitive::hash();
         seed = cldnn::hash_combine(seed, levels);
         seed = cldnn::hash_combine(seed, scale_shift_opt);
+        seed = cldnn::hash_combine(seed, output_round_to_even);
         seed = cldnn::hash_combine(seed, need_post_scale);
         seed = cldnn::hash_combine(seed, need_post_shift);
         seed = cldnn::hash_combine(seed, need_pre_shift);
@@ -98,6 +101,7 @@ struct quantize : public primitive_base<quantize> {
 
         return levels == rhs_casted.levels &&
                scale_shift_opt == rhs_casted.scale_shift_opt &&
+               output_round_to_even == rhs_casted.output_round_to_even &&
                need_post_scale == rhs_casted.need_post_scale &&
                need_post_shift == rhs_casted.need_post_shift &&
                need_pre_shift == rhs_casted.need_pre_shift &&
@@ -124,6 +128,7 @@ struct quantize : public primitive_base<quantize> {
         primitive_base<quantize>::save(ob);
         ob << levels;
         ob << scale_shift_opt;
+        ob << output_round_to_even;
         ob << need_post_scale;
         ob << need_post_shift;
         ob << need_pre_shift;
@@ -150,6 +155,7 @@ struct quantize : public primitive_base<quantize> {
         primitive_base<quantize>::load(ib);
         ib >> levels;
         ib >> scale_shift_opt;
+        ib >> output_round_to_even;
         ib >> need_post_scale;
         ib >> need_post_shift;
         ib >> need_pre_shift;

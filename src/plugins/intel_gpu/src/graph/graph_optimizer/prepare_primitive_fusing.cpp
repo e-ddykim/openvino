@@ -931,6 +931,8 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                 GPU_DEBUG_IF(p.get_config().get_disable_post_ops_fusions() != 12)
                     return;
             }
+            if (quantize_node.get_output_round_to_even())
+                return;
             auto& input_data = quantize_node.get_dependency(0);
             if (input_data.get_users().size() != 1 || input_data.get_dependencies().empty())
                 return;

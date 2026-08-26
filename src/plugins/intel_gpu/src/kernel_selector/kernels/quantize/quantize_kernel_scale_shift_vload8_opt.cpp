@@ -69,6 +69,7 @@ JitConstants QuantizeKernelScaleShift_vload8::GetJitConstants(const quantize_par
     jit.AddConstant(MakeJitConstant("OUT_SHIFT_VAL", params.out_shift));
     jit.AddConstant(MakeJitConstant("CAN_USE_OUTPUT_RANGE", can_use_output_range));
     jit.AddConstant(MakeJitConstant("HAS_OUTPUT_RANGE_ROUND", has_output_range_round));
+    jit.AddConstant(MakeJitConstant("OUTPUT_ROUND_TO_EVEN", params.output_round_to_even));
     auto total_size = CalculateTotalWorkItemCount(params);
     if (total_size % vec_size) {
         // handle some leftovers
