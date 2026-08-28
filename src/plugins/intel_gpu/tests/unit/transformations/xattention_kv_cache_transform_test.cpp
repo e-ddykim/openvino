@@ -13,11 +13,18 @@
 #include "openvino/core/model.hpp"
 #include "openvino/core/node_vector.hpp"
 #include "openvino/core/partial_shape.hpp"
+#include "openvino/op/add.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
+#include "openvino/op/fake_quantize.hpp"
+#include "openvino/op/multiply.hpp"
+#include "openvino/op/mvn.hpp"
 #include "openvino/op/paged_attention.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/runtime/internal_properties.hpp"
 #include "openvino/runtime/properties.hpp"
+#include "ov_ops/type_relaxed.hpp"
 #include "test_utils.h"
 
 #include "../../../src/plugin/transformations_pipeline.cpp"
@@ -124,6 +131,50 @@ std::shared_ptr<v0::Parameter> find_parameter_by_name(const std::shared_ptr<cons
     return nullptr;
 }
 
+std::shared_ptr<ov::Model> create_lpt_add_mvn_model(const bool with_reshape_branch = false) {
+    const Shape shape{1, 4, 2, 2};
+    auto input0 = std::make_shared<v0::Parameter>(element::i8, shape);
+    auto input1 = std::make_shared<v0::Parameter>(element::i8, shape);
+
+    auto dequantize = [](const Output<Node>& input, float scale) {
+        auto convert = std::make_shared<v0::Convert>(input, element::f32);
+        auto scale_constant = v0::Constant::create(element::f32, Shape{}, {scale});
+        return std::make_shared<ov::op::v1::Multiply>(convert, scale_constant);
+    };
+
+    auto add = std::make_shared<ov::op::v1::Add>(dequantize(input0, 0.5f), dequantize(input1, 0.25f));
+    auto mvn = std::make_shared<v0::MVN>(add, AxisSet{2, 3}, true, 1e-9);
+    mvn->set_friendly_name("target_mvn");
+
+    auto quantization_input = std::make_shared<v0::Parameter>(element::f32, shape);
+    auto input_low = v0::Constant::create(element::f32, Shape{}, {-1.f});
+    auto input_high = v0::Constant::create(element::f32, Shape{}, {1.f});
+    auto output_low = v0::Constant::create(element::f32, Shape{}, {-1.f});
+    auto output_high = v0::Constant::create(element::f32, Shape{}, {1.f});
+    auto fake_quantize = std::make_shared<v0::FakeQuantize>(quantization_input, input_low, input_high, output_low, output_high, 256);
+
+    OutputVector outputs{mvn, fake_quantize};
+    if (with_reshape_branch) {
+        auto reshape_pattern = v0::Constant::create(element::i64, Shape{3}, {1, 4, 4});
+        auto reshape = std::make_shared<ov::op::v1::Reshape>(add, reshape_pattern, false);
+        reshape->set_friendly_name("target_reshape");
+        auto reshape_mvn = std::make_shared<v0::MVN>(reshape, AxisSet{1, 2}, true, 1e-9);
+        reshape_mvn->set_friendly_name("target_reshape_mvn");
+        outputs.push_back(reshape_mvn);
+    }
+
+    return std::make_shared<Model>(outputs, ParameterVector{input0, input1, quantization_input});
+}
+
+std::shared_ptr<Node> find_node_by_name(const std::shared_ptr<const Model>& model, const std::string& friendly_name) {
+    for (const auto& node : model->get_ordered_ops()) {
+        if (node->get_friendly_name() == friendly_name) {
+            return node;
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 TEST(XAttentionTransformPipelineTest, NormalizesByTokenFp16RtInfoToCompressedCacheLayout) {
@@ -178,6 +229,70 @@ TEST(XAttentionTransformPipelineTest, NormalizesByTokenFp16RtInfoToCompressedCac
     // Those 4 bytes store per-token scale and zero-point as two fp16 values.
     EXPECT_EQ(key_shape[3].get_length(), 68);
     EXPECT_EQ(value_shape[3].get_length(), 68);
+}
+
+TEST(LPTTransformPipelineTest, KeepsFp16ScaleBeforeMvnWithFp32LptAdd) {
+    auto& engine = get_test_engine();
+    auto context = std::make_shared<ov::intel_gpu::RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});
+    auto model = create_lpt_add_mvn_model();
+
+    auto config = get_test_default_config(engine);
+    config.set_user_property({ov::hint::inference_precision(element::f16)});
+    config.finalize(context.get(), model.get());
+
+    ov::intel_gpu::TransformationsPipeline pipeline(config, context);
+    pipeline.apply(model);
+
+    const auto mvn = find_node_by_name(model, "target_mvn");
+    ASSERT_NE(mvn, nullptr);
+    EXPECT_EQ(mvn->get_input_element_type(0), element::f16);
+
+    const auto scale_multiply = ov::as_type_ptr<ov::op::v1::Multiply>(mvn->get_input_node_shared_ptr(0));
+    ASSERT_NE(scale_multiply, nullptr);
+    const auto relaxed_multiply = std::dynamic_pointer_cast<ov::op::TypeRelaxedBase>(scale_multiply);
+    ASSERT_NE(relaxed_multiply, nullptr);
+    EXPECT_EQ(relaxed_multiply->get_origin_input_type(0), element::f32);
+    EXPECT_EQ(relaxed_multiply->get_origin_input_type(1), element::f32);
+    EXPECT_EQ(relaxed_multiply->get_overridden_output_type(), element::f16);
+
+    std::shared_ptr<Node> add;
+    for (const auto& input : scale_multiply->input_values()) {
+        if (ov::is_type<ov::op::v1::Add>(input.get_node_shared_ptr())) {
+            add = input.get_node_shared_ptr();
+            break;
+        }
+    }
+    ASSERT_NE(add, nullptr);
+    EXPECT_EQ(add->get_output_element_type(0), element::f32);
+    EXPECT_NE(std::dynamic_pointer_cast<ov::op::TypeRelaxedBase>(add), nullptr);
+}
+
+TEST(LPTTransformPipelineTest, KeepsSharedFp16ScaleBeforeReshapeMvnWithFp32LptAdd) {
+    auto& engine = get_test_engine();
+    auto context = std::make_shared<ov::intel_gpu::RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});
+    auto model = create_lpt_add_mvn_model(true);
+
+    auto config = get_test_default_config(engine);
+    config.set_user_property({ov::hint::inference_precision(element::f16)});
+    config.finalize(context.get(), model.get());
+
+    ov::intel_gpu::TransformationsPipeline pipeline(config, context);
+    pipeline.apply(model);
+
+    const auto direct_mvn = find_node_by_name(model, "target_mvn");
+    const auto reshape = find_node_by_name(model, "target_reshape");
+    const auto reshape_mvn = find_node_by_name(model, "target_reshape_mvn");
+    ASSERT_NE(direct_mvn, nullptr);
+    ASSERT_NE(reshape, nullptr);
+    ASSERT_NE(reshape_mvn, nullptr);
+    EXPECT_EQ(reshape->get_input_element_type(0), element::f16);
+    EXPECT_EQ(reshape_mvn->get_input_element_type(0), element::f16);
+    EXPECT_EQ(reshape_mvn->get_input_node_shared_ptr(0), reshape);
+
+    const auto shared_scale = ov::as_type_ptr<ov::op::v1::Multiply>(reshape->get_input_node_shared_ptr(0));
+    ASSERT_NE(shared_scale, nullptr);
+    EXPECT_EQ(direct_mvn->get_input_node_shared_ptr(0), shared_scale);
+    EXPECT_EQ(shared_scale->get_output_target_inputs(0).size(), 2);
 }
 
 }  // namespace ov::test::intel_gpu
