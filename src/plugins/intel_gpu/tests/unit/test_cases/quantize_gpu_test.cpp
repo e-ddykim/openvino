@@ -11,6 +11,7 @@
 #include "quantize_inst.h"
 
 #include <cstddef>
+#include <cstdlib>
 
 using namespace cldnn;
 using namespace ::tests;
@@ -941,6 +942,263 @@ TEST(quantize_gpu, dynamic_fsv16) {
     for (size_t i = 0; i < ref_data.size(); ++i) {
         ASSERT_NEAR(output_ptr[i], ref_data[i], 1) << " index = " << i;
     }
+}
+
+TEST(quantize_gpu, scale_shift_2dblk_fsv32_per_channel_tail) {
+    auto& engine = get_test_engine();
+    constexpr int batch_size = 2;
+    constexpr int feature_size = 64;
+    constexpr int input_x = 34;
+    constexpr int input_y = 1;
+
+    const layout input_layout_desc{data_types::f16, format::b_fs_yx_fsv32, tensor(batch_size, feature_size, input_x, input_y)};
+    auto input = engine.allocate_memory(input_layout_desc);
+    auto input_low = engine.allocate_memory({data_types::f16, format::bfyx, {1, feature_size, 1, 1}});
+    auto input_high = engine.allocate_memory({data_types::f16, format::bfyx, {1, feature_size, 1, 1}});
+    auto output_low = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+    auto output_high = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+
+    {
+        mem_lock<ov::float16> input_ptr{input, get_test_stream()};
+        for (int batch = 0; batch < batch_size; ++batch) {
+            for (int feature = 0; feature < feature_size; ++feature) {
+                for (int x = 0; x < input_x; ++x) {
+                    const auto coords = tensor(cldnn::batch(batch), cldnn::feature(feature), spatial(x, 0, 0, 0));
+                    const auto offset = input_layout_desc.get_linear_offset(coords);
+                    input_ptr[offset] = ov::float16(((batch * 13 + feature * 7 + x * 3) % 41 - 20) * 0.5f);
+                }
+            }
+        }
+    }
+
+    std::vector<ov::float16> input_low_values(feature_size);
+    std::vector<ov::float16> input_high_values(feature_size);
+    for (int feature = 0; feature < feature_size; ++feature) {
+        const float low = -8.0f + static_cast<float>(feature % 9) * 0.25f;
+        input_low_values[feature] = ov::float16(low);
+        input_high_values[feature] = ov::float16(low + 12.0f + static_cast<float>(feature % 5) * 0.5f);
+    }
+    set_values(input_low, input_low_values);
+    set_values(input_high, input_high_values);
+    set_values<ov::float16>(output_low, {ov::float16(-128.0f)});
+    set_values<ov::float16>(output_high, {ov::float16(127.0f)});
+
+    auto make_topology = [&]() {
+        return topology(cldnn::input_layout("input", input_layout_desc),
+                        data("input_low", input_low),
+                        data("input_high", input_high),
+                        data("output_low", output_low),
+                        data("output_high", output_high),
+                        quantize("quantize",
+                                 input_info("input"),
+                                 input_info("input_low"),
+                                 input_info("input_high"),
+                                 input_info("output_low"),
+                                 input_info("output_high"),
+                                 256,
+                                 data_types::i8));
+    };
+
+    auto make_config = [&](const std::string& kernel_name) {
+        ExecutionConfig config = get_test_default_config(engine);
+        config.set_property(ov::intel_gpu::custom_outputs(std::vector<std::string>{"quantize"}));
+        config.set_property(ov::intel_gpu::optimize_data(true));
+        config.set_property(
+            ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"quantize", {format::b_fs_yx_fsv32, kernel_name, impl_types::ocl}}}));
+        return config;
+    };
+
+    network reference_network(engine, make_topology(), make_config("quantize_gpu_scale_shift_opt"));
+    network optimized_network(engine, make_topology(), make_config("quantize_gpu_scale_shift_2dblk_opt"));
+    reference_network.set_input_data("input", input);
+    optimized_network.set_input_data("input", input);
+
+    auto optimized_impl = optimized_network.get_primitive("quantize")->get_impl();
+    ASSERT_NE(optimized_impl, nullptr);
+    ASSERT_NE(optimized_impl->get_kernel_name().find("quantize_gpu_scale_shift_2dblk_opt"), std::string::npos);
+
+    auto reference_output = reference_network.execute().at("quantize").get_memory();
+    auto optimized_output = optimized_network.execute().at("quantize").get_memory();
+    mem_lock<int8_t, mem_lock_type::read> reference_ptr{reference_output, get_test_stream()};
+    mem_lock<int8_t, mem_lock_type::read> optimized_ptr{optimized_output, get_test_stream()};
+
+    for (int batch = 0; batch < batch_size; ++batch) {
+        for (int feature = 0; feature < feature_size; ++feature) {
+            for (int x = 0; x < input_x; ++x) {
+                const auto coords = tensor(cldnn::batch(batch), cldnn::feature(feature), spatial(x, 0, 0, 0));
+                const auto reference_offset = reference_output->get_layout().get_linear_offset(coords);
+                const auto optimized_offset = optimized_output->get_layout().get_linear_offset(coords);
+                ASSERT_EQ(optimized_ptr[optimized_offset], reference_ptr[reference_offset]) << "batch=" << batch << ", feature=" << feature << ", x=" << x;
+            }
+        }
+    }
+}
+
+TEST(quantize_gpu, DISABLED_scale_shift_2dblk_vtune) {
+    auto& engine = get_test_engine();
+    constexpr int batch_size = 6;
+    constexpr int feature_size = 256;
+    constexpr int input_x = 108;
+    constexpr int input_y = 108;
+    constexpr size_t warmup_iterations = 32;
+    constexpr size_t default_profile_iterations = 16384;
+    constexpr size_t enqueue_batch_size = 64;
+
+    const char* profile_iterations_env = std::getenv("OV_GPU_QUANTIZE_PROFILE_ITERATIONS");
+    const size_t profile_iterations = profile_iterations_env == nullptr ? default_profile_iterations : static_cast<size_t>(std::stoull(profile_iterations_env));
+    ASSERT_GT(profile_iterations, 0u);
+
+    const layout input_layout_desc{data_types::f16, format::b_fs_yx_fsv32, tensor(batch_size, feature_size, input_x, input_y)};
+    const layout output_layout_desc{data_types::i8, format::b_fs_yx_fsv32, tensor(batch_size, feature_size, input_x, input_y)};
+    ASSERT_TRUE(engine.supports_allocation(allocation_type::usm_device));
+    auto input = engine.allocate_memory(input_layout_desc, allocation_type::usm_device, false);
+    auto output = engine.allocate_memory(output_layout_desc, allocation_type::usm_device, false);
+    auto input_low = engine.allocate_memory({data_types::f16, format::bfyx, {1, feature_size, 1, 1}});
+    auto input_high = engine.allocate_memory({data_types::f16, format::bfyx, {1, feature_size, 1, 1}});
+    auto output_low = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+    auto output_high = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+
+    const std::vector<ov::float16> input_values(input->count(), ov::float16(0.5f));
+    std::vector<ov::float16> input_low_values(feature_size);
+    std::vector<ov::float16> input_high_values(feature_size);
+    for (int feature = 0; feature < feature_size; ++feature) {
+        const float low = -8.0f + static_cast<float>(feature % 9) * 0.25f;
+        input_low_values[feature] = ov::float16(low);
+        input_high_values[feature] = ov::float16(low + 12.0f + static_cast<float>(feature % 5) * 0.5f);
+    }
+    set_values(input_low, input_low_values);
+    set_values(input_high, input_high_values);
+    set_values<ov::float16>(output_low, {ov::float16(-128.0f)});
+    set_values<ov::float16>(output_high, {ov::float16(127.0f)});
+
+    topology topology_desc(input_layout("input", input_layout_desc),
+                           data("input_low", input_low),
+                           data("input_high", input_high),
+                           data("output_low", output_low),
+                           data("output_high", output_high),
+                           quantize("quantize",
+                                    input_info("input"),
+                                    input_info("input_low"),
+                                    input_info("input_high"),
+                                    input_info("output_low"),
+                                    input_info("output_high"),
+                                    256,
+                                    data_types::i8));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::custom_outputs(std::vector<std::string>{"quantize"}));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::queue_type(QueueTypes::in_order));
+    config.set_property(ov::intel_gpu::force_implementations(
+        ov::intel_gpu::ImplForcingMap{{"quantize", {format::b_fs_yx_fsv32, "quantize_gpu_scale_shift_2dblk_opt", impl_types::ocl}}}));
+
+    network profile_network(engine, topology_desc, config);
+    input->copy_from(profile_network.get_stream(), input_values.data(), true);
+    profile_network.set_input_data("input", input);
+    profile_network.set_output_memory("quantize", output);
+
+    auto input_inst = profile_network.get_primitive("input");
+    auto optimized_inst = profile_network.get_primitive("quantize");
+    ASSERT_EQ(input_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_device);
+    ASSERT_EQ(optimized_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_device);
+    auto optimized_impl = optimized_inst->get_impl();
+    ASSERT_NE(optimized_impl, nullptr);
+    ASSERT_NE(optimized_impl->get_kernel_name().find("quantize_gpu_scale_shift_2dblk_opt"), std::string::npos);
+
+    auto execute_iterations = [&](size_t iteration_count) {
+        size_t completed_iterations = 0;
+        while (completed_iterations < iteration_count) {
+            const size_t remaining_iterations = iteration_count - completed_iterations;
+            const size_t current_batch_size = remaining_iterations < enqueue_batch_size ? remaining_iterations : enqueue_batch_size;
+            for (size_t iteration = 0; iteration < current_batch_size; ++iteration)
+                profile_network.execute();
+            profile_network.get_stream().finish();
+            completed_iterations += current_batch_size;
+        }
+    };
+
+    execute_iterations(warmup_iterations);
+    execute_iterations(profile_iterations);
+}
+
+TEST(quantize_gpu, DISABLED_scale_shift_vload8_fsv32_vtune) {
+    auto& engine = get_test_engine();
+    constexpr int batch_size = 6;
+    constexpr int feature_size = 256;
+    constexpr int input_x = 108;
+    constexpr int input_y = 108;
+    constexpr size_t warmup_iterations = 32;
+    constexpr size_t default_profile_iterations = 16384;
+    constexpr size_t enqueue_batch_size = 64;
+
+    const char* profile_iterations_env = std::getenv("OV_GPU_QUANTIZE_PROFILE_ITERATIONS");
+    const size_t profile_iterations = profile_iterations_env == nullptr ? default_profile_iterations : static_cast<size_t>(std::stoull(profile_iterations_env));
+    ASSERT_GT(profile_iterations, 0u);
+
+    const layout input_layout_desc{data_types::f16, format::b_fs_yx_fsv32, tensor(batch_size, feature_size, input_x, input_y)};
+    const layout output_layout_desc{data_types::i8, format::b_fs_yx_fsv32, tensor(batch_size, feature_size, input_x, input_y)};
+    ASSERT_TRUE(engine.supports_allocation(allocation_type::usm_device));
+    auto input = engine.allocate_memory(input_layout_desc, allocation_type::usm_device, false);
+    auto output = engine.allocate_memory(output_layout_desc, allocation_type::usm_device, false);
+    auto input_low = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+    auto input_high = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+    auto output_low = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+    auto output_high = engine.allocate_memory({data_types::f16, format::bfyx, {1, 1, 1, 1}});
+
+    const std::vector<ov::float16> input_values(input->count(), ov::float16(0.5f));
+    set_values<ov::float16>(input_low, {ov::float16(-8.0f)});
+    set_values<ov::float16>(input_high, {ov::float16(8.0f)});
+    set_values<ov::float16>(output_low, {ov::float16(-128.0f)});
+    set_values<ov::float16>(output_high, {ov::float16(127.0f)});
+
+    topology topology_desc(input_layout("input", input_layout_desc),
+                           data("input_low", input_low),
+                           data("input_high", input_high),
+                           data("output_low", output_low),
+                           data("output_high", output_high),
+                           quantize("quantize",
+                                    input_info("input"),
+                                    input_info("input_low"),
+                                    input_info("input_high"),
+                                    input_info("output_low"),
+                                    input_info("output_high"),
+                                    256,
+                                    data_types::i8));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::custom_outputs(std::vector<std::string>{"quantize"}));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::queue_type(QueueTypes::in_order));
+    config.set_property(ov::intel_gpu::force_implementations(
+        ov::intel_gpu::ImplForcingMap{{"quantize", {format::b_fs_yx_fsv32, "quantize_gpu_scale_shift_vload8_opt", impl_types::ocl}}}));
+
+    network profile_network(engine, topology_desc, config);
+    input->copy_from(profile_network.get_stream(), input_values.data(), true);
+    profile_network.set_input_data("input", input);
+    profile_network.set_output_memory("quantize", output);
+
+    auto input_inst = profile_network.get_primitive("input");
+    auto optimized_inst = profile_network.get_primitive("quantize");
+    ASSERT_EQ(input_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_device);
+    ASSERT_EQ(optimized_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_device);
+    auto optimized_impl = optimized_inst->get_impl();
+    ASSERT_NE(optimized_impl, nullptr);
+    ASSERT_NE(optimized_impl->get_kernel_name().find("quantize_gpu_scale_shift_vload8_opt"), std::string::npos);
+
+    auto execute_iterations = [&](size_t iteration_count) {
+        size_t completed_iterations = 0;
+        while (completed_iterations < iteration_count) {
+            const size_t remaining_iterations = iteration_count - completed_iterations;
+            const size_t current_batch_size = remaining_iterations < enqueue_batch_size ? remaining_iterations : enqueue_batch_size;
+            for (size_t iteration = 0; iteration < current_batch_size; ++iteration)
+                profile_network.execute();
+            profile_network.get_stream().finish();
+            completed_iterations += current_batch_size;
+        }
+    };
+
+    execute_iterations(warmup_iterations);
+    execute_iterations(profile_iterations);
 }
 
 struct quantize_random_test_params {
