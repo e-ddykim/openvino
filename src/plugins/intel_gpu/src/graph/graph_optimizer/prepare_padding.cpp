@@ -88,8 +88,10 @@ void prepare_padding::run(program& p) {
                     if (input_usr->get_preferred_impl_type() == impl_types::onednn)
                         is_usr_onednn = true;
 
-                if ((input.get_preferred_impl_type() == impl_types::onednn || is_usr_onednn) &&
-                    node.get_preferred_impl_type() == impl_types::ocl &&
+                const bool requires_unpadded_output = input.is_type<convolution>() && (input.as<convolution>().fused_input_quantization_term() ||
+                                                                                       input.as<convolution>().get_primitive()->fused_output_transpose);
+                if ((requires_unpadded_output ||
+                     ((input.get_preferred_impl_type() == impl_types::onednn || is_usr_onednn) && node.get_preferred_impl_type() == impl_types::ocl)) &&
                     static_cast<bool>(needed_padding)) {
                     auto new_reorder = std::make_shared<reorder>(node.id() + "_padding_reorder_for_" + input.id(), input.id(), input.get_output_layout());
                     auto& new_reorder_node = p.get_or_create(new_reorder);
@@ -208,6 +210,8 @@ void prepare_padding::run(program& p) {
         }
     }
 
+    std::vector<convolution_node*> plain_input_convolutions;
+
     // Prepare optimized padding for bfyx convolution.
     for (auto& pair : p.nodes_map) {
         if (pair.second->type() != convolution::type_id())
@@ -216,6 +220,11 @@ void prepare_padding::run(program& p) {
         auto& node = pair.second->as<convolution>();
         if (node.get_dependencies().empty())
             continue;
+
+        if (node.fused_input_quantization_term() || node.get_primitive()->fused_output_transpose) {
+            plain_input_convolutions.push_back(&node);
+            continue;
+        }
 
         if (node.is_dynamic() && !node.use_explicit_padding())
             continue;
@@ -255,10 +264,12 @@ void prepare_padding::run(program& p) {
 
         auto needed_padding = get_needed_padding_for_convolution(node);
 
-        // WA to add reorder between MVN and Convolution or between col2im and Convolution
-        // because Conv need input_node data with padding but MVN opt with default format and col2im do not support padding.
+        // WA to add reorder for producers that do not support output padding.
         if (node.get_preferred_impl_type() == impl_types::ocl && format::is_default_format(conv_input_node.get_output_layout().format)) {
-            if (conv_input_node.is_type<mvn>() || conv_input_node.is_type<col2im>()) {
+            const bool requires_unpadded_output =
+                conv_input_node.is_type<convolution>() && (conv_input_node.as<convolution>().fused_input_quantization_term() ||
+                                                           conv_input_node.as<convolution>().get_primitive()->fused_output_transpose);
+            if (conv_input_node.is_type<mvn>() || conv_input_node.is_type<col2im>() || (requires_unpadded_output && static_cast<bool>(needed_padding))) {
                 auto new_reorder = std::make_shared<reorder>(node.id() + "_padding_reorder_for_" + conv_input_node.id(),
                                                             conv_input_node.id(), conv_input_node.get_output_layout());
                 auto& new_reorder_node = p.get_or_create(new_reorder);
@@ -268,6 +279,22 @@ void prepare_padding::run(program& p) {
         }
 
         p.apply_needed_padding(node, node.get_dependency(0), needed_padding);
+    }
+
+    // These convolutions read their input as byxf and handle the spatial halo with explicit bounds
+    // checks, so they need it unpadded and channels-innermost.
+    for (auto* node : plain_input_convolutions) {
+        auto& input = node->get_dependency(0);
+        auto input_layout = input.get_output_layout();
+        if (input_layout.format == format::byxf && !input_layout.data_padding)
+            continue;
+
+        input_layout.format = format::byxf;
+        input_layout.data_padding = padding{};
+        auto reorder_prim = std::make_shared<reorder>(input.id() + "_byxf_reorder_for_" + node->id(), input.id(), input_layout);
+        auto& reorder_node = p.get_or_create(reorder_prim);
+        p.add_intermediate(reorder_node, *node, input);
+        reorder_node.recalc_output_layouts(false);
     }
 }
 

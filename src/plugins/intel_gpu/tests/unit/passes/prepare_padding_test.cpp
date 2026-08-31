@@ -104,3 +104,34 @@ TEST(prepare_padding, col2im_conv) {
         }
     }
 }
+
+TEST(prepare_padding, fused_transpose_convolution_output_remains_unpadded) {
+    auto& engine = get_test_engine();
+    auto in_layout = layout{ov::PartialShape{1, 32, 8, 10}, data_types::f16, format::bfyx};
+    auto producer_weights = engine.allocate_memory({ov::PartialShape{32, 1, 1, 3, 3}, data_types::f16, format::bfzyx});
+    auto consumer_weights = engine.allocate_memory({ov::PartialShape{8, 8, 3, 3}, data_types::f16, format::bfyx});
+
+    auto producer = convolution("producer", input_info("input"), "producer_weights", "", "", "", "", 32, {1, 1}, {1, 1}, {1, 1}, {1, 1}, true, data_types::f16);
+    producer.fused_output_transpose = true;
+
+    topology topology;
+    topology.add(input_layout("input", in_layout));
+    topology.add(data("producer_weights", producer_weights));
+    topology.add(data("consumer_weights", consumer_weights));
+    topology.add(producer);
+    topology.add(convolution("consumer", input_info("producer"), "consumer_weights", "", 1, {1, 1}, {1, 1}, {1, 1}, {1, 1}, false));
+    topology.add(reorder("output", input_info("consumer"), format::bfyx, data_types::f16));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    auto program = program::build_program(engine, topology, config, false, true);
+    program->get_node("producer").set_preferred_impl_type(impl_types::ocl);
+    program->get_node("consumer").set_preferred_impl_type(impl_types::ocl);
+
+    program_wrapper::apply_opt_pass<prepare_padding>(*program, true);
+
+    ASSERT_TRUE(has_node(*program, "consumer_padding_reorder_for_producer"));
+    EXPECT_FALSE(program->get_node("producer").get_output_layout().data_padding);
+    EXPECT_EQ(program->get_node("consumer").get_dependency(0).id(), "consumer_padding_reorder_for_producer");
+    EXPECT_TRUE(program->get_node("consumer_padding_reorder_for_producer").get_output_layout().data_padding);
+}

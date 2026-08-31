@@ -207,6 +207,16 @@ struct convolution : public primitive_base<convolution> {
     input_info activations_zero_points;
     /// @brief Primitive id containing compensation.
     input_info compensation;
+    /// @brief Primitive id containing per-channel input quantization scales.
+    input_info input_quantization_scale;
+    /// @brief Primitive id containing per-channel input quantization shifts (quantized zero points).
+    input_info input_quantization_shift;
+    /// @brief Scalar shift applied after input scale/shift and before INT8 conversion.
+    float input_quantization_output_shift {0.0f};
+    /// @brief Performs input quantization arithmetic in FP16 while keeping parameter buffers in FP32.
+    bool input_quantization_use_fp16_arithmetic{false};
+    /// @brief Emits the logical convolution output with the last three axes rotated.
+    bool fused_output_transpose {false};
 
     size_t hash() const override {
         size_t seed = primitive::hash();
@@ -227,6 +237,11 @@ struct convolution : public primitive_base<convolution> {
         seed = hash_combine(seed, !weights_zero_points.is_valid());
         seed = hash_combine(seed, !activations_zero_points.is_valid());
         seed = hash_combine(seed, !compensation.is_valid());
+        seed = hash_combine(seed, !input_quantization_scale.is_valid());
+        seed = hash_combine(seed, !input_quantization_shift.is_valid());
+        seed = hash_combine(seed, input_quantization_output_shift);
+        seed = hash_combine(seed, input_quantization_use_fp16_arithmetic);
+        seed = hash_combine(seed, fused_output_transpose);
         return seed;
     }
 
@@ -253,7 +268,12 @@ struct convolution : public primitive_base<convolution> {
                cmp_fields(bias.is_valid()) &&
                cmp_fields(weights_zero_points.is_valid()) &&
                cmp_fields(activations_zero_points.is_valid()) &&
-               cmp_fields(compensation.is_valid());
+               cmp_fields(compensation.is_valid()) &&
+               cmp_fields(input_quantization_scale.is_valid()) &&
+               cmp_fields(input_quantization_shift.is_valid()) &&
+               cmp_fields(input_quantization_output_shift) &&
+               cmp_fields(input_quantization_use_fp16_arithmetic) &&
+               cmp_fields(fused_output_transpose);
         #undef cmp_fields
     }
 
@@ -276,6 +296,11 @@ struct convolution : public primitive_base<convolution> {
         ob << weights_zero_points;
         ob << activations_zero_points;
         ob << compensation;
+        ob << input_quantization_scale;
+        ob << input_quantization_shift;
+        ob << input_quantization_output_shift;
+        ob << input_quantization_use_fp16_arithmetic;
+        ob << fused_output_transpose;
     }
 
     void load(BinaryInputBuffer& ib) override {
@@ -297,6 +322,11 @@ struct convolution : public primitive_base<convolution> {
         ib >> weights_zero_points;
         ib >> activations_zero_points;
         ib >> compensation;
+        ib >> input_quantization_scale;
+        ib >> input_quantization_shift;
+        ib >> input_quantization_output_shift;
+        ib >> input_quantization_use_fp16_arithmetic;
+        ib >> fused_output_transpose;
     }
 
 protected:
@@ -318,6 +348,12 @@ protected:
 
         if (compensation.is_valid())
             ret[idx++] = &compensation;
+
+        if (input_quantization_scale.is_valid())
+            ret[idx++] = &input_quantization_scale;
+
+        if (input_quantization_shift.is_valid())
+            ret[idx++] = &input_quantization_shift;
 
         return ret;
     }

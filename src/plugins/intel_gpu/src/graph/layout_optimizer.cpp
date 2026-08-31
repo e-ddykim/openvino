@@ -1447,11 +1447,24 @@ format layout_optimizer::get_preferred_format(program_node& node) {
     if (!_forcing_map.empty() && _forcing_map.count(node.id()) != 0) {
         expected = _forcing_map.at(node.id()).first;
     } else if (node.is_type<convolution>()) {
-        expected = get_expected_format(node.as<convolution>());
-        // Set expected input and output preferred format for onednn convolution in dynamic.
-        // This is a temporal implementation because we are guessing required format for OneDNN conv. In the end, we should use byxf format.
-        if (node.is_dynamic() && use_onednn_impls)
-            set_onednn_dyn_conv_preferred_format(node.as<convolution>());
+        auto& convolution_node = node.as<convolution>();
+        if (convolution_node.fused_input_quantization_term() ||
+            convolution_node.get_primitive()->fused_output_transpose) {
+            // This convolution wants channels innermost on both sides. byxf on the untransposed
+            // input and bfyx on the transposed output are the same byte order, so the absorbed
+            // transpose stays free while the kernel still gets one full cache line per channel
+            // block. Requesting byxf costs no reorder either: the producers of this input are a
+            // permute or a resample, both of which can emit it directly.
+            expected = format::bfyx;
+            node.set_preferred_input_fmt(0, format::byxf);
+            node.set_preferred_output_fmt(0, format::bfyx);
+        } else {
+            expected = get_expected_format(convolution_node);
+            // Set expected input and output preferred format for onednn convolution in dynamic.
+            // This is a temporal implementation because we are guessing required format for OneDNN conv. In the end, we should use byxf format.
+            if (node.is_dynamic() && use_onednn_impls)
+                set_onednn_dyn_conv_preferred_format(convolution_node);
+        }
     } else if (node.is_type<quantize>()) {
         expected = get_expected_format(node.as<quantize>());
     } else if (node.is_type<reorder>() || node.is_type<input_layout>()) {

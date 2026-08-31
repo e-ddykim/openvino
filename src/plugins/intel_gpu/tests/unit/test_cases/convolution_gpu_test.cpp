@@ -2,31 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include "test_utils.h"
-#include "random_generator.hpp"
-
-#include <intel_gpu/primitives/input_layout.hpp>
-#include <intel_gpu/primitives/convolution.hpp>
-#include <intel_gpu/primitives/eltwise.hpp>
-#include <intel_gpu/primitives/data.hpp>
-#include <intel_gpu/primitives/crop.hpp>
-#include <intel_gpu/primitives/reorder.hpp>
-#include <intel_gpu/primitives/reshape.hpp>
-#include <intel_gpu/primitives/permute.hpp>
-
-#include "openvino/reference/convolution.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <iostream>
-#include <iomanip>
-#include <thread>
-#include <type_traits>
 #include <fstream>
+#include <intel_gpu/primitives/convolution.hpp>
+#include <intel_gpu/primitives/crop.hpp>
+#include <intel_gpu/primitives/data.hpp>
+#include <intel_gpu/primitives/eltwise.hpp>
+#include <intel_gpu/primitives/input_layout.hpp>
+#include <intel_gpu/primitives/permute.hpp>
+#include <intel_gpu/primitives/quantize.hpp>
+#include <intel_gpu/primitives/reorder.hpp>
+#include <intel_gpu/primitives/reshape.hpp>
+#include <iomanip>
+#include <iostream>
+#include <thread>
 #include <tuple>
+#include <type_traits>
 
 #include "convolution_inst.h"
+#include "openvino/reference/convolution.hpp"
+#include "random_generator.hpp"
+#include "test_utils.h"
 #ifdef ENABLE_ONEDNN_FOR_GPU
 #include "graph/impls/onednn/utils.hpp"
 #endif
@@ -13298,6 +13296,153 @@ TEST(convolution_gpu_bfyx_f16, dynamic_fused_input_scalar_and_non_scalar_fp32) {
     ASSERT_NE(conv_info, primitives_info.end());
     ASSERT_NE(std::find(conv_info->c_fused_ids.begin(), conv_info->c_fused_ids.end(), "add"), conv_info->c_fused_ids.end());
     ASSERT_NE(conv_info->kernel_id.find("convolution_gpu_bfyx_f16_1x1"), std::string::npos);
+}
+
+static void run_fused_quantize_dw_convolution_case(size_t batch, size_t channels, size_t height, size_t width) {
+    auto& engine = get_test_engine();
+    const auto& device_info = engine.get_device_info();
+    if (device_info.arch < gpu_arch::xe2 || !device_info.supports_imad)
+        GTEST_SKIP();
+
+    const ov::Shape input_shape{batch, channels, height, width};
+    const ov::Shape quantization_shape{1, channels, 1, 1};
+    const ov::Shape weights_shape{channels, 1, 1, 3, 3};
+
+    auto input = engine.allocate_memory({input_shape, data_types::f16, format::bfyx});
+    auto input_low = engine.allocate_memory({quantization_shape, data_types::f16, format::bfyx});
+    auto input_high = engine.allocate_memory({quantization_shape, data_types::f16, format::bfyx});
+    auto output_low = engine.allocate_memory({quantization_shape, data_types::f16, format::bfyx});
+    auto output_high = engine.allocate_memory({quantization_shape, data_types::f16, format::bfyx});
+    auto weights = engine.allocate_memory({weights_shape, data_types::i8, format::goiyx});
+    auto bias = engine.allocate_memory({quantization_shape, data_types::f16, format::bfyx});
+    auto post_scale = engine.allocate_memory({quantization_shape, data_types::f16, format::bfyx});
+
+    std::vector<float> input_low_values(channels);
+    std::vector<float> input_high_values(channels);
+    std::vector<float> bias_values(channels);
+    std::vector<float> post_scale_values(channels);
+    for (size_t channel = 0; channel < channels; ++channel) {
+        input_low_values[channel] = -48.375f + static_cast<float>(channel) * 0.15625f;
+        input_high_values[channel] = input_low_values[channel] + 139.5f + static_cast<float>(channel % 7) * 1.25f;
+        bias_values[channel] = static_cast<float>(static_cast<int>(channel % 5) - 2) * 0.5f;
+        post_scale_values[channel] = channel % 2 == 0 ? 0.25f : -0.5f;
+    }
+
+    std::vector<float> input_values(input->count());
+    for (size_t index = 0; index < input_values.size(); ++index) {
+        const size_t channel = (index / (height * width)) % channels;
+        const size_t spatial = index % (height * width);
+        const size_t batch_index = index / (channels * height * width);
+        const float scale = 255.0f / (input_high_values[channel] - input_low_values[channel]);
+        const float fraction = spatial % 2 == 0 ? 0.375f : 0.625f;
+        const float quantized_position = static_cast<float>((spatial * 17 + batch_index * 31) % 240) + fraction;
+        input_values[index] = input_low_values[channel] + quantized_position / scale;
+    }
+    input_values[0] = 67.875f;
+
+    std::vector<int8_t> weights_values(weights->count());
+    for (size_t index = 0; index < weights_values.size(); ++index) {
+        const size_t channel = index / 9;
+        const size_t tap = index % 9;
+        weights_values[index] = static_cast<int8_t>(static_cast<int>((tap * 5 + channel * 3) % 11) - 5);
+    }
+
+    set_values(input, std::vector<ov::float16>(input_values.begin(), input_values.end()));
+    set_values(input_low, std::vector<ov::float16>(input_low_values.begin(), input_low_values.end()));
+    set_values(input_high, std::vector<ov::float16>(input_high_values.begin(), input_high_values.end()));
+    set_values(output_low, std::vector<ov::float16>(channels, -128.0f));
+    set_values(output_high, std::vector<ov::float16>(channels, 127.0f));
+    set_values(weights, weights_values);
+    set_values(bias, std::vector<ov::float16>(bias_values.begin(), bias_values.end()));
+    set_values(post_scale, std::vector<ov::float16>(post_scale_values.begin(), post_scale_values.end()));
+
+    auto make_topology = [&](bool transpose_output) {
+        topology result(
+            input_layout("input", input->get_layout()),
+            data("input_low", input_low),
+            data("input_high", input_high),
+            data("output_low", output_low),
+            data("output_high", output_high),
+            data("weights", weights),
+            data("bias", bias),
+            data("post_scale", post_scale),
+            quantize("quantize",
+                     input_info("input"),
+                     input_info("input_low"),
+                     input_info("input_high"),
+                     input_info("output_low"),
+                     input_info("output_high"),
+                     256,
+                     data_types::i8),
+            convolution("conv", input_info("quantize"), "weights", "bias", "", "", "", channels, {1, 1}, {1, 1}, {1, 1}, {1, 1}, true, data_types::f16),
+            eltwise("post_scale_op", {input_info("conv"), input_info("post_scale")}, eltwise_mode::prod, data_types::f16));
+
+        if (transpose_output) {
+            result.add(permute("transpose", input_info("post_scale_op"), {0, 2, 3, 1}));
+            result.add(reorder("output", input_info("transpose"), format::bfyx, data_types::f16));
+        } else {
+            result.add(reorder("output", input_info("post_scale_op"), format::bfyx, data_types::f16));
+        }
+
+        return result;
+    };
+
+    ExecutionConfig fused_config = get_test_default_config(engine);
+    fused_config.set_property(ov::intel_gpu::optimize_data(true));
+    fused_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+
+    ExecutionConfig reference_config = get_test_default_config(engine);
+    reference_config.set_property(ov::intel_gpu::optimize_data(true));
+    reference_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+
+    network fused_network(engine, make_topology(true), fused_config);
+    network reference_network(engine, make_topology(false), reference_config);
+    fused_network.set_input_data("input", input);
+    reference_network.set_input_data("input", input);
+
+    const auto& primitives_info = fused_network.get_primitives_info();
+    const auto convolution_info = std::find_if(primitives_info.begin(), primitives_info.end(), [](const primitive_info& info) {
+        return info.kernel_id.find("convolution_gpu_bfyx_f16_i8_dw_fused_quantize_imad") != std::string::npos;
+    });
+    ASSERT_NE(convolution_info, primitives_info.end());
+
+    const auto& reference_primitives_info = reference_network.get_primitives_info();
+    const auto quantize_info = std::find_if(reference_primitives_info.begin(), reference_primitives_info.end(), [](const primitive_info& info) {
+        return info.original_id == "quantize";
+    });
+    ASSERT_NE(quantize_info, reference_primitives_info.end());
+    ASSERT_NE(quantize_info->kernel_id.find("quantize_gpu_scale_shift_opt"), std::string::npos);
+
+    auto fused_outputs = fused_network.execute();
+    auto reference_outputs = reference_network.execute();
+    const auto fused_values = get_output_values_to_float(fused_network, fused_outputs.at("output"));
+    const auto reference_values = get_output_values_to_float(reference_network, reference_outputs.at("output"));
+
+    ASSERT_EQ(fused_values.size(), reference_values.size());
+    for (size_t batch_index = 0; batch_index < batch; ++batch_index) {
+        for (size_t y = 0; y < height; ++y) {
+            for (size_t x = 0; x < width; ++x) {
+                for (size_t channel = 0; channel < channels; ++channel) {
+                    const size_t fused_index = ((batch_index * height + y) * width + x) * channels + channel;
+                    const size_t reference_index = ((batch_index * channels + channel) * height + y) * width + x;
+                    ASSERT_NEAR(fused_values[fused_index], reference_values[reference_index], 1e-3f)
+                        << "Mismatch at b=" << batch_index << ", c=" << channel << ", y=" << y << ", x=" << x;
+                }
+            }
+        }
+    }
+}
+
+// Rows narrower than the kernel's per-lane vector load exercise only the bounds-checked
+// per-element input path.
+TEST(convolution_gpu_bfyx_f16_i8_dw_fused_quantize_imad, compare_with_unfused) {
+    run_fused_quantize_dw_convolution_case(2, 64, 9, 15);
+}
+
+// Wider rows with a partial trailing y tile exercise the wide per-lane vector load on the interior
+// x tiles and the per-element path on the first and the last one.
+TEST(convolution_gpu_bfyx_f16_i8_dw_fused_quantize_imad, compare_with_unfused_wide_rows) {
+    run_fused_quantize_dw_convolution_case(2, 64, 11, 40);
 }
 
 // ---------------------------------------------------------------------------

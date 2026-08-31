@@ -31,6 +31,10 @@ struct convolution_params : public weight_bias_zero_point_params {
     bool deformable_mask_enabled {false};
     bool has_explicit_paddings {false};
     bool grouped_weights_shape {false};
+    bool fused_input_quantization {false};
+    bool fused_output_transpose {false};
+    float input_quantization_output_shift {0.0f};
+    bool input_quantization_use_fp16_arithmetic{false};
     DataTensor intermediate_tensor;
 
     std::string to_string() const override;

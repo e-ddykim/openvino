@@ -61,6 +61,18 @@ public:
         return get_dependency(2 + (1 * static_cast<int>(bias_term()) + 1 * static_cast<int>(weights_zero_points_term()) + 1*static_cast<int>(activations_zero_points_term())) + get_deform_conv_dep_offset());
     }
 
+    program_node& input_quantization_scale() const {
+        return get_dependency(2 + static_cast<int>(bias_term()) + static_cast<int>(weights_zero_points_term()) +
+                              static_cast<int>(activations_zero_points_term()) + static_cast<int>(compensation_term()) +
+                              get_deform_conv_dep_offset());
+    }
+
+    program_node& input_quantization_shift() const {
+        return get_dependency(3 + static_cast<int>(bias_term()) + static_cast<int>(weights_zero_points_term()) +
+                              static_cast<int>(activations_zero_points_term()) + static_cast<int>(compensation_term()) +
+                              get_deform_conv_dep_offset());
+    }
+
     program_node& trans() const {
         if (!deformable_mode)
             throw std::range_error("trans input exists only in deformable mode");
@@ -89,6 +101,10 @@ public:
     bool weights_zero_points_term() const { return get_primitive()->weights_zero_points.is_valid(); }
     bool compensation_term() const { return get_primitive()->compensation.is_valid(); }
     bool activations_zero_points_term() const { return get_primitive()->activations_zero_points.is_valid(); }
+    bool fused_input_quantization_term() const {
+        return get_primitive()->input_quantization_scale.is_valid() &&
+               get_primitive()->input_quantization_shift.is_valid();
+    }
     bool use_explicit_padding() const { return get_primitive()->auto_pad == ov::op::PadType::EXPLICIT; }
 
     // Currently convolution with constant weight is only supported for dynamic shape
@@ -182,11 +198,27 @@ public:
                               + _deform_conv_dep_offset);
     }
 
+    memory::ptr input_quantization_scale_memory() const {
+        return dep_memory_ptr(2 + static_cast<int>(bias_term()) + static_cast<int>(weights_zero_points_term()) +
+                              static_cast<int>(activations_zero_points_term()) + static_cast<int>(compensation_term()) +
+                              _deform_conv_dep_offset);
+    }
+
+    memory::ptr input_quantization_shift_memory() const {
+        return dep_memory_ptr(3 + static_cast<int>(bias_term()) + static_cast<int>(weights_zero_points_term()) +
+                              static_cast<int>(activations_zero_points_term()) + static_cast<int>(compensation_term()) +
+                              _deform_conv_dep_offset);
+    }
+
     bool bias_term() const { return _impl_params->bias_layout.has_value(); }
 
     bool weights_zero_points_term() const { return _impl_params->weights_zero_points_layout.has_value(); }
     bool compensation_term() const { return _impl_params->compensation_layout.has_value(); }
     bool activations_zero_points_term() const { return _impl_params->activations_zero_points_layout.has_value(); }
+    bool fused_input_quantization_term() const {
+        const auto& desc = get_typed_desc<convolution>();
+        return desc->input_quantization_scale.is_valid() && desc->input_quantization_shift.is_valid();
+    }
 
 private:
     int32_t _deform_conv_dep_offset = 0;

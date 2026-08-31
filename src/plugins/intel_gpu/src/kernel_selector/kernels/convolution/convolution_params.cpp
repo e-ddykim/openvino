@@ -21,6 +21,10 @@ std::string convolution_params::to_string() const {
     s << stride.x << "_" << stride.y << "_";
     s << dilation.x << "_" << dilation.y << "_";
     s << padding_begin.x << "_" << padding_begin.y << "_";
+    s << fused_input_quantization << "_";
+    s << fused_output_transpose << "_";
+    s << input_quantization_output_shift << "_";
+    s << input_quantization_use_fp16_arithmetic << "_";
     s << 1;
 
     return s.str();
@@ -35,7 +39,11 @@ std::string convolution_params::to_cache_string_v2() const {
     s << dilation.x << "_" << dilation.y << "_" << dilation.z << ";";
     s << padding_begin.x << "_" << padding_begin.y << "_" << padding_begin.z << ";";
     s << 1 << ";";
-    s << groups;
+    s << groups << ";";
+    s << fused_input_quantization << ";";
+    s << fused_output_transpose << ";";
+    s << input_quantization_output_shift << ";";
+    s << input_quantization_use_fp16_arithmetic;
 
     return s.str();
 }
@@ -49,6 +57,14 @@ ParamsKey convolution_params::GetParamsKey() const {
 
     if (groups > 1) {
         k.EnableGroupedConvolution();
+    }
+
+    if (fused_input_quantization) {
+        k.EnableFusedInputQuantization();
+    }
+
+    if (fused_output_transpose) {
+        k.EnableFusedOutputTranspose();
     }
 
     if (deformable_mode) {

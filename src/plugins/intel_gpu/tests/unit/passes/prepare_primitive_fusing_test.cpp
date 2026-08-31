@@ -14,6 +14,8 @@
 #include "intel_gpu/graph/program.hpp"
 #include "intel_gpu/primitives/concatenation.hpp"
 #include "intel_gpu/primitives/permute.hpp"
+#include "intel_gpu/primitives/quantize.hpp"
+#include "intel_gpu/primitives/resample.hpp"
 #include "intel_gpu/primitives/scatter_update.hpp"
 #include "intel_gpu/runtime/engine.hpp"
 #include "pass_manager.h"
@@ -855,4 +857,185 @@ TEST(prepare_primitive_fusing, dont_fuse_bias_when_multiple_users) {
 
     ASSERT_TRUE(has_node(*prog, "eltw"));
     ASSERT_TRUE(has_node(*prog, "conv"));
+}
+
+TEST(prepare_primitive_fusing, fuse_quantize_depthwise_convolution_and_transpose) {
+    auto& engine = get_test_engine();
+    if (engine.get_device_info().arch < gpu_arch::xe2 || !engine.get_device_info().supports_imad)
+        GTEST_SKIP();
+
+    constexpr size_t channels = 32;
+    auto in_layout = layout{ov::PartialShape{1, channels, 4, 5}, data_types::f16, format::bfyx};
+    auto quantization_layout = layout{ov::PartialShape{1, channels, 1, 1}, data_types::f16, format::bfyx};
+    auto weights_layout = layout{ov::PartialShape{channels, 1, 1, 3, 3}, data_types::i8, format::goiyx};
+    auto bias_layout = layout{ov::PartialShape{1, channels, 1, 1}, data_types::f16, format::bfyx};
+
+    auto input_low = engine.allocate_memory(quantization_layout);
+    auto input_high = engine.allocate_memory(quantization_layout);
+    auto output_low = engine.allocate_memory(quantization_layout);
+    auto output_high = engine.allocate_memory(quantization_layout);
+    auto weights = engine.allocate_memory(weights_layout);
+    auto bias = engine.allocate_memory(bias_layout);
+    auto post_scale = engine.allocate_memory(bias_layout);
+
+    std::vector<float> input_low_values(channels);
+    std::vector<float> input_high_values(channels);
+    std::vector<float> output_low_values(channels, -128.0f);
+    std::vector<float> output_high_values(channels, 127.0f);
+    for (size_t channel = 0; channel < channels; ++channel) {
+        input_low_values[channel] = -1.0f - static_cast<float>(channel) / 32.0f;
+        input_high_values[channel] = 1.0f + static_cast<float>(channel) / 32.0f;
+    }
+    set_values(input_low, std::vector<ov::float16>(input_low_values.begin(), input_low_values.end()));
+    set_values(input_high, std::vector<ov::float16>(input_high_values.begin(), input_high_values.end()));
+    set_values(output_low, std::vector<ov::float16>(output_low_values.begin(), output_low_values.end()));
+    set_values(output_high, std::vector<ov::float16>(output_high_values.begin(), output_high_values.end()));
+
+    topology topology;
+    topology.add(input_layout("input", in_layout));
+    topology.add(data("input_low", input_low));
+    topology.add(data("input_high", input_high));
+    topology.add(data("output_low", output_low));
+    topology.add(data("output_high", output_high));
+    topology.add(data("weights", weights));
+    topology.add(data("bias", bias));
+    topology.add(data("post_scale", post_scale));
+    topology.add(resample("resample",
+                          input_info("input"),
+                          std::vector<int64_t>{1, static_cast<int64_t>(channels), 8, 10},
+                          std::vector<float>{},
+                          std::vector<int64_t>{0, 1, 2, 3},
+                          {},
+                          {},
+                          0,
+                          -0.75f,
+                          resample::InterpolateOp::InterpolateMode::LINEAR_ONNX));
+    topology.add(activation("resample_side_output", input_info("resample"), activation_func::relu));
+    topology.add(quantize("quantize",
+                          input_info("resample"),
+                          input_info("input_low"),
+                          input_info("input_high"),
+                          input_info("output_low"),
+                          input_info("output_high"),
+                          256,
+                          data_types::i8));
+    topology.add(convolution("conv", input_info("quantize"), "weights", "bias", "", "", "", channels, {1, 1}, {1, 1}, {1, 1}, {1, 1}, true, data_types::f16));
+    topology.add(eltwise("post_scale_op", {input_info("conv"), input_info("post_scale")}, eltwise_mode::prod, data_types::f16));
+    topology.add(permute("transpose", input_info("post_scale_op"), {0, 2, 3, 1}));
+    topology.add(reorder("output", input_info("transpose"), format::bfyx, data_types::f16));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    auto program = program::build_program(engine, topology, config, false, true);
+
+    EXPECT_TRUE(program->get_node("resample").get_output_layout().is_static());
+    program_wrapper::apply_opt_pass<prepare_quantization>(*program);
+    EXPECT_EQ(program->get_node("quantize_in_scale").get_output_layout().data_type, data_types::f16);
+    EXPECT_EQ(program->get_node("quantize_in_shift").get_output_layout().data_type, data_types::f16);
+    program_wrapper::apply_opt_pass<prepare_primitive_fusing>(*program);
+
+    ASSERT_FALSE(has_node(*program, "quantize"));
+    ASSERT_FALSE(has_node(*program, "post_scale_op"));
+    ASSERT_FALSE(has_node(*program, "transpose"));
+    ASSERT_TRUE(has_node(*program, "conv"));
+    ASSERT_TRUE(has_node(*program, "resample"));
+    ASSERT_TRUE(has_node(*program, "resample_side_output"));
+
+    auto& convolution_node = program->get_node("conv").as<convolution>();
+    const auto convolution_primitive = convolution_node.get_primitive();
+    EXPECT_TRUE(convolution_primitive->input_quantization_scale.is_valid());
+    EXPECT_TRUE(convolution_primitive->input_quantization_shift.is_valid());
+    EXPECT_FLOAT_EQ(convolution_primitive->input_quantization_output_shift, -128.0f);
+    EXPECT_TRUE(convolution_primitive->input_quantization_use_fp16_arithmetic);
+    EXPECT_TRUE(convolution_primitive->fused_output_transpose);
+    EXPECT_EQ(convolution_node.get_dependency(0).id(), "resample");
+    EXPECT_EQ(convolution_node.get_dependency(3).id(), "quantize_in_scale");
+    EXPECT_EQ(convolution_node.get_dependency(4).id(), "quantize_in_shift");
+    EXPECT_EQ(convolution_node.get_dependency(3).get_output_layout().data_type, data_types::f32);
+    EXPECT_EQ(convolution_node.get_dependency(4).get_output_layout().data_type, data_types::f32);
+    EXPECT_EQ(convolution_node.get_dependency(5).id(), "post_scale");
+    ASSERT_EQ(convolution_node.get_fused_primitives().size(), 1);
+    const auto& fused_post_scale = convolution_node.get_fused_primitives().front();
+    EXPECT_TRUE(fused_post_scale.is_type<eltwise>());
+    EXPECT_EQ(fused_post_scale.outer_dep_start_idx, 5);
+    ASSERT_EQ(fused_post_scale.inputs.size(), 2);
+    EXPECT_EQ(fused_post_scale.inputs[1].m_type, FusedInputType::EXTERNAL);
+    EXPECT_EQ(fused_post_scale.inputs[1].m_idx, 5);
+    EXPECT_EQ(convolution_node.get_output_layout().format, format::bfyx);
+    EXPECT_EQ(convolution_node.get_output_layout().get_partial_shape(), ov::PartialShape({1, 8, 10, channels}));
+    EXPECT_EQ(program->get_node("output").get_dependency(0).id(), "conv");
+}
+
+TEST(prepare_primitive_fusing, preserve_quantize_depthwise_convolution_for_unsupported_requirements) {
+    auto& engine = get_test_engine();
+    if (engine.get_device_info().arch < gpu_arch::xe2 || !engine.get_device_info().supports_imad)
+        GTEST_SKIP();
+
+    const auto build_program = [&engine](size_t channels, format bias_format) {
+        auto in_layout = layout{ov::PartialShape{1, ov::Dimension::value_type(channels) , 8, 10}, data_types::f16, format::bfyx};
+        auto quantization_layout = layout{ov::PartialShape{1, ov::Dimension::value_type(channels), 1, 1}, data_types::f32, format::bfyx};
+        auto weights_layout = layout{ov::PartialShape{ov::Dimension::value_type(channels), 1, 1, 3, 3}, data_types::i8, format::goiyx};
+        auto bias_layout = layout{ov::PartialShape{1, ov::Dimension::value_type(channels), 1, 1}, data_types::f16, bias_format};
+
+        auto input_low = engine.allocate_memory(quantization_layout);
+        auto input_high = engine.allocate_memory(quantization_layout);
+        auto output_low = engine.allocate_memory(quantization_layout);
+        auto output_high = engine.allocate_memory(quantization_layout);
+        auto weights = engine.allocate_memory(weights_layout);
+        auto bias = engine.allocate_memory(bias_layout);
+
+        std::vector<float> input_low_values(channels);
+        std::vector<float> input_high_values(channels);
+        std::vector<float> output_low_values(channels, -128.0f);
+        std::vector<float> output_high_values(channels, 127.0f);
+        for (size_t channel = 0; channel < channels; ++channel) {
+            input_low_values[channel] = -1.0f - static_cast<float>(channel) / 32.0f;
+            input_high_values[channel] = 1.0f + static_cast<float>(channel) / 32.0f;
+        }
+        set_values(input_low, input_low_values);
+        set_values(input_high, input_high_values);
+        set_values(output_low, output_low_values);
+        set_values(output_high, output_high_values);
+
+        topology topology;
+        topology.add(input_layout("input", in_layout));
+        topology.add(data("input_low", input_low));
+        topology.add(data("input_high", input_high));
+        topology.add(data("output_low", output_low));
+        topology.add(data("output_high", output_high));
+        topology.add(data("weights", weights));
+        topology.add(data("bias", bias));
+        topology.add(quantize("quantize",
+                              input_info("input"),
+                              input_info("input_low"),
+                              input_info("input_high"),
+                              input_info("output_low"),
+                              input_info("output_high"),
+                              256,
+                              data_types::i8));
+        topology.add(
+            convolution("conv", input_info("quantize"), "weights", "bias", "", "", "", channels, {1, 1}, {1, 1}, {1, 1}, {1, 1}, true, data_types::f16));
+        topology.add(permute("transpose", input_info("conv"), {0, 2, 3, 1}));
+        topology.add(reorder("output", input_info("transpose"), format::bfyx, data_types::f16));
+
+        ExecutionConfig config = get_test_default_config(engine);
+        config.set_property(ov::intel_gpu::optimize_data(true));
+        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+        auto program = program::build_program(engine, topology, config, false, true);
+        program_wrapper::apply_opt_pass<prepare_quantization>(*program);
+        program_wrapper::apply_opt_pass<prepare_primitive_fusing>(*program);
+        return program;
+    };
+
+    const auto expect_fallback = [](const std::shared_ptr<program>& program) {
+        ASSERT_TRUE(has_node(*program, "quantize"));
+        ASSERT_TRUE(has_node(*program, "conv"));
+        ASSERT_TRUE(has_node(*program, "transpose"));
+        EXPECT_FALSE(program->get_node("conv").as<convolution>().fused_input_quantization_term());
+        EXPECT_FALSE(program->get_node("conv").as<convolution>().get_primitive()->fused_output_transpose);
+    };
+
+    expect_fallback(build_program(16, format::bfyx));
+    expect_fallback(build_program(32, format::byxf));
 }

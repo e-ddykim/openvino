@@ -49,6 +49,10 @@ protected:
         args.weights_zero_points = instance.weights_zero_points_term() ? instance.weights_zero_points_memory() : nullptr;
         args.activations_zero_points = instance.activations_zero_points_term() ? instance.activations_zero_points_memory() : nullptr;
         args.compensation = instance.compensation_term() ? instance.compensation_memory() : nullptr;
+        if (instance.fused_input_quantization_term()) {
+            args.inputs.push_back(instance.input_quantization_scale_memory());
+            args.inputs.push_back(instance.input_quantization_shift_memory());
+        }
 
         return args;
     }
@@ -82,6 +86,21 @@ public:
 
         conv_params.groups = groups;
         conv_params.grouped_weights_shape = primitive->grouped_weights_shape;
+        conv_params.fused_input_quantization = primitive->input_quantization_scale.is_valid() &&
+                                               primitive->input_quantization_shift.is_valid();
+        conv_params.fused_output_transpose = primitive->fused_output_transpose;
+        conv_params.input_quantization_output_shift = primitive->input_quantization_output_shift;
+        conv_params.input_quantization_use_fp16_arithmetic = primitive->input_quantization_use_fp16_arithmetic;
+        if (conv_params.fused_input_quantization) {
+            const size_t quantization_dep_idx = 2 + static_cast<size_t>(primitive->bias.is_valid()) +
+                                                static_cast<size_t>(primitive->weights_zero_points.is_valid()) +
+                                                static_cast<size_t>(primitive->activations_zero_points.is_valid()) +
+                                                static_cast<size_t>(primitive->compensation.is_valid());
+            OPENVINO_ASSERT(impl_param.input_layouts.size() > quantization_dep_idx + 1,
+                            "[GPU] Fused convolution input quantization dependencies are missing");
+            conv_params.inputs.push_back(convert_data_tensor(impl_param.input_layouts[quantization_dep_idx]));
+            conv_params.inputs.push_back(convert_data_tensor(impl_param.input_layouts[quantization_dep_idx + 1]));
+        }
 
         auto deform_conv_dep_offset = primitive->deformable_mode ? 1 : 0;
         if (primitive->input.size() == 3)

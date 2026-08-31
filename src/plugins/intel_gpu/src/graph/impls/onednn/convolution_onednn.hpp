@@ -29,6 +29,8 @@ struct ConvolutionImplementationManager : public ImplementationManager {
             return false;
 
         const auto& conv_node = node.as<convolution>();
+        if (conv_node.fused_input_quantization_term() || conv_node.get_primitive()->fused_output_transpose)
+            return false;
 
         const auto& in_layout = conv_node.get_input_layout(0);
         const auto& out_layout = conv_node.get_output_layout(0);

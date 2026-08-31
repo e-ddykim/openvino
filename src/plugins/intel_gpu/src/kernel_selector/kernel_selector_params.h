@@ -177,6 +177,8 @@ public:
                         uint32_t deformable : 1;
                         uint32_t bilinear_interpolation_pad : 1;
                         uint32_t deformable_mask_enabled : 1;
+                        uint32_t fused_input_quantization : 1;
+                        uint32_t fused_output_transpose : 1;
                     } conv;
                     struct fc_t {
                     } fc;
@@ -327,6 +329,8 @@ public:
     void EnableDeformableMode() { key.restrict.val.dedicated.conv.deformable = 1; }
     void EnableBilinearInterpolationPad() { key.restrict.val.dedicated.conv.bilinear_interpolation_pad = 1; }
     void EnableDeformableMask() { key.restrict.val.dedicated.conv.deformable_mask_enabled = 1; }
+    void EnableFusedInputQuantization() { key.restrict.val.dedicated.conv.fused_input_quantization = 1; }
+    void EnableFusedOutputTranspose() { key.restrict.val.dedicated.conv.fused_output_transpose = 1; }
 
     void EnableQuantizeScaleShiftOpt() { key.restrict.val.dedicated.quantize.scale_shift_opt = 1; }
     void EnableIndirectGemm() { key.restrict.val.dedicated.gemm.indirect = 1; }

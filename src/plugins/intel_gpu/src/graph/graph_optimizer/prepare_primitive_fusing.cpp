@@ -1,57 +1,57 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-#include "intel_gpu/runtime/debug_configuration.hpp"
-#include "program_helpers.h"
-#include "pass_manager.h"
-
-#include "pooling_inst.h"
-#include "proposal_inst.h"
-#include "roi_pooling_inst.h"
-#include "quantize_inst.h"
-#include "activation_inst.h"
-#include "batch_to_space_inst.h"
-#include "crop_inst.h"
-#include "eltwise_inst.h"
-#include "gemm_inst.h"
-#include "lrn_inst.h"
-#include "mvn_inst.h"
-#include "rms_inst.h"
-#include "pooling_inst.h"
-#include "normalize_inst.h"
-#include "permute_inst.h"
-#include "reshape_inst.h"
-#include "softmax_inst.h"
-#include "resample_inst.h"
-#include "depth_to_space_inst.h"
-#include "fully_connected_inst.h"
-#include "space_to_depth_inst.h"
-#include "gather_inst.h"
-#include "gather_nd_inst.h"
-#include "gather_elements_inst.h"
-#include "scatter_update_inst.h"
-#include "scatter_nd_update_inst.h"
-#include "scatter_elements_update_inst.h"
-#include "reverse_sequence_inst.h"
-#include "shuffle_channels_inst.h"
-#include "space_to_batch_inst.h"
-#include "strided_slice_inst.h"
-#include "cum_sum_inst.h"
-#include "embedding_bag_inst.h"
-#include "swiglu_inst.h"
-#include "gather_matmul_inst.h"
-#include "extract_image_patches_inst.h"
-#include "reduce_inst.h"
-#include "group_normalization_inst.h"
-#include "lora_inst.h"
-#include "broadcast_inst.h"
-#include <vector>
-#include <map>
+#include <deque>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
-#include <deque>
+#include <vector>
+
+#include "activation_inst.h"
+#include "batch_to_space_inst.h"
+#include "broadcast_inst.h"
+#include "convolution_inst.h"
+#include "crop_inst.h"
+#include "cum_sum_inst.h"
+#include "depth_to_space_inst.h"
+#include "eltwise_inst.h"
+#include "embedding_bag_inst.h"
+#include "extract_image_patches_inst.h"
+#include "fully_connected_inst.h"
+#include "gather_elements_inst.h"
+#include "gather_inst.h"
+#include "gather_matmul_inst.h"
+#include "gather_nd_inst.h"
+#include "gemm_inst.h"
+#include "group_normalization_inst.h"
+#include "intel_gpu/runtime/debug_configuration.hpp"
+#include "lora_inst.h"
+#include "lrn_inst.h"
+#include "mvn_inst.h"
+#include "normalize_inst.h"
+#include "pass_manager.h"
+#include "permute_inst.h"
+#include "pooling_inst.h"
+#include "program_helpers.h"
+#include "proposal_inst.h"
+#include "quantize_inst.h"
+#include "reduce_inst.h"
+#include "resample_inst.h"
+#include "reshape_inst.h"
+#include "reverse_sequence_inst.h"
+#include "rms_inst.h"
+#include "roi_pooling_inst.h"
+#include "scatter_elements_update_inst.h"
+#include "scatter_nd_update_inst.h"
+#include "scatter_update_inst.h"
+#include "shuffle_channels_inst.h"
+#include "softmax_inst.h"
+#include "space_to_batch_inst.h"
+#include "space_to_depth_inst.h"
+#include "strided_slice_inst.h"
+#include "swiglu_inst.h"
 #ifdef ENABLE_ONEDNN_FOR_GPU
 #include <impls/onednn/utils.hpp>
 #endif
@@ -76,6 +76,8 @@ void prepare_primitive_fusing::run(program& p) {
                 fuse_constant_transposes(p); return;
             case 8:
                 optimize_fused_ops(p); return;
+            case 9:
+                fuse_quantize_depthwise_convolution(p); return;
             default:
                 return;
         }
@@ -88,6 +90,182 @@ void prepare_primitive_fusing::run(program& p) {
     fuse_simple_primitives(p);
     fuse_constant_transposes(p);
     optimize_fused_ops(p);
+    fuse_quantize_depthwise_convolution(p);
+}
+
+void prepare_primitive_fusing::fuse_quantize_depthwise_convolution(program& p) {
+    const auto& device_info = p.get_engine().get_device_info();
+    if (device_info.arch < gpu_arch::xe2 || !device_info.supports_imad)
+        return;
+
+    std::vector<primitive_id> quantize_ids;
+    for (auto* node : p.get_processing_order()) {
+        if (node->is_type<quantize>())
+            quantize_ids.push_back(node->id());
+    }
+
+    for (const auto& quantize_id : quantize_ids) {
+        if (!p.has_node(quantize_id))
+            continue;
+
+        auto& quantize_node = p.get_node(quantize_id).as<quantize>();
+        const auto quantize_prim = quantize_node.get_primitive();
+        if (quantize_node.get_dependencies().size() != 9 || quantize_node.get_users().size() != 1 || quantize_node.get_levels() != 256 ||
+            !quantize_node.get_scale_shift_opt() || quantize_node.get_output_layout().data_type != data_types::i8 || quantize_node.get_need_clamp() ||
+            quantize_node.get_need_post_scale() || !quantize_node.get_per_tensor_output_range() || !quantize_node.get_per_tensor_output_scale() ||
+            !quantize_node.get_per_tensor_output_shift() || quantize_node.get_output_scale_val() != 1.0f ||
+            quantize_node.get_output_lo_val() >= quantize_node.get_output_hi_val()) {
+            continue;
+        }
+
+        auto& input_node = quantize_node.input();
+        const auto& input_layout = input_node.get_output_layout();
+        if (!input_layout.is_static() || input_layout.format != format::bfyx || input_layout.data_type != data_types::f16 ||
+            format::dimension(input_layout.format) != 4 || input_layout.data_padding) {
+            continue;
+        }
+
+        const auto channels = input_layout.feature();
+        if (input_layout.batch() <= 0 || channels <= 0 || channels % 32 != 0 || input_layout.spatial(0) <= 0 || input_layout.spatial(1) <= 0)
+            continue;
+
+        auto& scale_node = quantize_node.get_dependency(5);
+        auto& shift_node = quantize_node.get_dependency(6);
+        if (!scale_node.is_type<data>() || !shift_node.is_type<data>())
+            continue;
+
+        const auto valid_per_channel_layout = [channels](const layout& param_layout) {
+            return param_layout.is_static() && param_layout.format == format::bfyx && param_layout.batch() == 1 && param_layout.feature() == channels &&
+                   param_layout.spatial(0) == 1 && param_layout.spatial(1) == 1 &&
+                   (param_layout.data_type == data_types::f16 || param_layout.data_type == data_types::f32) && !param_layout.data_padding;
+        };
+        if (!valid_per_channel_layout(scale_node.get_output_layout()) || !valid_per_channel_layout(shift_node.get_output_layout()) ||
+            scale_node.get_output_layout().data_type != shift_node.get_output_layout().data_type) {
+            continue;
+        }
+        const bool use_fp16_quantization_arithmetic = scale_node.get_output_layout().data_type == data_types::f16;
+
+        auto* convolution_user = quantize_node.get_users().front();
+        if (!convolution_user->is_type<convolution>())
+            continue;
+
+        auto& convolution_node = convolution_user->as<convolution>();
+        const auto convolution_prim = convolution_node.get_primitive();
+        if (convolution_node.get_users().size() != 1 || convolution_prim->deformable_mode || convolution_prim->transposed ||
+            !convolution_prim->grouped_weights_shape || convolution_prim->groups != static_cast<uint32_t>(channels) || !all_ones(convolution_prim->stride) ||
+            !all_ones(convolution_prim->dilation) || convolution_prim->padding_begin != ov::CoordinateDiff({1, 1}) ||
+            convolution_prim->padding_end != ov::CoordinateDiff({1, 1}) || convolution_prim->weights_zero_points.is_valid() ||
+            convolution_prim->activations_zero_points.is_valid() || convolution_prim->compensation.is_valid()) {
+            continue;
+        }
+
+        const auto weights_layout = convolution_node.weights().get_output_layout().convert_to_weights_layout(true);
+        if (!weights_layout.is_static() || weights_layout.data_type != data_types::i8 || weights_layout.group() != channels || weights_layout.ofm() != 1 ||
+            weights_layout.ifm() != 1 || weights_layout.spatial(0) != 3 || weights_layout.spatial(1) != 3) {
+            continue;
+        }
+
+        if (convolution_prim->bias.is_valid()) {
+            const auto& bias_layout = convolution_node.bias().get_output_layout();
+            if (!bias_layout.is_static() || bias_layout.format != format::bfyx || bias_layout.batch() != 1 || bias_layout.feature() != channels ||
+                bias_layout.spatial(0) != 1 || bias_layout.spatial(1) != 1 || bias_layout.data_padding) {
+                continue;
+            }
+        }
+
+        const auto& convolution_layout = convolution_node.get_output_layout();
+        if (!convolution_layout.is_static() || convolution_layout.data_type != data_types::f16 || convolution_layout.batch() != input_layout.batch() ||
+            convolution_layout.feature() != channels || convolution_layout.spatial(0) != input_layout.spatial(0) ||
+            convolution_layout.spatial(1) != input_layout.spatial(1) ||
+            std::any_of(convolution_node.get_fused_primitives().begin(), convolution_node.get_fused_primitives().end(), [](const fused_primitive_desc& desc) {
+                return !desc.is_type<eltwise>() && !desc.is_type<quantize>() && !desc.is_type<activation>();
+            })) {
+            continue;
+        }
+
+        auto* permute_user = convolution_node.get_users().front();
+        if (!permute_user->is_type<permute>())
+            continue;
+
+        auto& permute_node = permute_user->as<permute>();
+        if (permute_node.is_output() || permute_node.has_fused_primitives() || permute_node.get_dependencies().size() != 1 ||
+            permute_node.get_permute_order() != std::vector<uint16_t>({0, 2, 3, 1}) || permute_node.get_output_layout().format != format::bfyx ||
+            permute_node.get_output_layout().data_type != data_types::f16) {
+            continue;
+        }
+
+        const auto convert_quantization_parameter_to_f32 = [&p](data_node& node) {
+            if (node.get_output_layout().data_type == data_types::f32)
+                return;
+
+            auto f32_layout = node.get_output_layout();
+            f32_layout.data_type = data_types::f32;
+            auto f32_memory = p.get_engine().allocate_memory(f32_layout, false);
+            {
+                mem_lock<ov::float16, mem_lock_type::read> source(node.get_attached_memory_ptr(), p.get_stream());
+                mem_lock<float, mem_lock_type::write> destination(f32_memory, p.get_stream());
+                for (size_t index = 0; index < f32_layout.count(); ++index)
+                    destination[index] = static_cast<float>(source[index]);
+            }
+            node.attach_memory(f32_memory, false);
+        };
+        convert_quantization_parameter_to_f32(scale_node);
+        convert_quantization_parameter_to_f32(shift_node);
+
+        auto fused_convolution_prim = convolution_prim->typed_clone();
+        fused_convolution_prim->id = convolution_node.id() + "_fused_input_quantize";
+        fused_convolution_prim->input[0] = quantize_prim->input[0];
+        fused_convolution_prim->input_quantization_scale = quantize_prim->input[5];
+        fused_convolution_prim->input_quantization_shift = quantize_prim->input[6];
+        fused_convolution_prim->input_quantization_output_shift = quantize_node.get_output_shift_val();
+        fused_convolution_prim->input_quantization_use_fp16_arithmetic = use_fp16_quantization_arithmetic;
+        fused_convolution_prim->fused_output_transpose = true;
+
+        const size_t quantization_dep_idx = 2 + static_cast<size_t>(fused_convolution_prim->bias.is_valid());
+        auto fused_primitives = convolution_node.get_fused_primitives();
+        for (auto& fused_primitive : fused_primitives) {
+            if (fused_primitive.has_outer_dep())
+                fused_primitive.outer_dep_start_idx += 2;
+
+            for (auto& input : fused_primitive.inputs) {
+                if (input.m_type == FusedInputType::EXTERNAL && input.m_idx >= quantization_dep_idx)
+                    input.m_idx += 2;
+            }
+        }
+
+        auto& fused_convolution_node = p.get_or_create(fused_convolution_prim);
+        fused_convolution_node.add_fused_primitives(fused_primitives);
+#ifdef ENABLE_ONEDNN_FOR_GPU
+        fused_convolution_node.get_fused_primitives_onednn() = convolution_node.get_fused_primitives_onednn();
+        for (auto& fused_primitive : fused_convolution_node.get_fused_primitives_onednn()) {
+            if (fused_primitive.mem_dep >= quantization_dep_idx)
+                fused_primitive.mem_dep += 2;
+        }
+#endif
+        p.replace(convolution_node, fused_convolution_node);
+        fused_convolution_node.replace_dependency(0, input_node, false);
+
+        const auto scale_dep = quantize_node.get_dependency_with_port(5);
+        const auto shift_dep = quantize_node.get_dependency_with_port(6);
+        fused_convolution_node.dependencies.insert(fused_convolution_node.dependencies.begin() + quantization_dep_idx, scale_dep);
+        fused_convolution_node.dependencies.insert(fused_convolution_node.dependencies.begin() + quantization_dep_idx + 1, shift_dep);
+        scale_dep.first->users.push_back(&fused_convolution_node);
+        shift_dep.first->users.push_back(&fused_convolution_node);
+        fused_convolution_node.add_memory_dependency(*scale_dep.first);
+        fused_convolution_node.add_memory_dependency(*shift_dep.first);
+
+        fused_convolution_node.recalc_output_layout();
+        p.add_optimized_primitive_info(quantize_node.id(), {fused_convolution_node.id()});
+        p.add_optimized_primitive_info(permute_node.id(), {fused_convolution_node.id()});
+        p.extract_and_remove(permute_node);
+
+        while (!quantize_node.get_dependencies().empty()) {
+            auto& dependency = quantize_node.get_dependency(quantize_node.get_dependencies().size() - 1);
+            p.remove_connection(dependency, quantize_node);
+            p.remove_if_dangling(dependency);
+        }
+        p.remove_if_dangling(quantize_node);
+    }
 }
 
 static std::optional<size_t> find_eltwise_const_dep_idx(const eltwise_node& node) {

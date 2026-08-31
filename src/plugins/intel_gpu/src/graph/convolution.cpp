@@ -145,6 +145,14 @@ std::vector<layout> calc_output_layout_impl(convolution_node const& node, kernel
         output_shapes = ov::op::v1::shape_infer(&op, input_shapes, pads_begin, pads_end);
     }
 
+    if (desc->fused_output_transpose) {
+        OPENVINO_ASSERT(output_shapes[0].rank().is_static() && output_shapes[0].rank().get_length() == 4,
+                        "[GPU] Fused convolution output transpose supports only 4D tensors");
+        const auto convolution_shape = output_shapes[0];
+        output_shapes[0] = {convolution_shape[0], convolution_shape[2], convolution_shape[3], convolution_shape[1]};
+        output_format = format::bfyx;
+    }
+
     return {layout{output_shapes[0], output_type, output_format}};
 }
 
@@ -227,6 +235,9 @@ convolution_inst::typed_primitive_inst(network& network, convolution_node const&
 
     if (bias_term()) {
         auto bias_inst = node.bias().get_output_layout();
+        const auto expected_bias_features = argument->fused_output_transpose
+                                                ? filter_inst.ofm() * filter_inst.group()
+                                                : output_size.feature[0];
         CLDNN_ERROR_NOT_EQUAL(node.id(),
                                 "Bias batch[0]",
                                 bias_inst.batch(),
@@ -237,7 +248,7 @@ convolution_inst::typed_primitive_inst(network& network, convolution_node const&
                                 "Bias feature[0]",
                                 bias_inst.feature(),
                                 "expected feature map number",
-                                output_size.feature[0],
+                                expected_bias_features,
                                 "Bias/fm mismatch");
         CLDNN_ERROR_NOT_EQUAL(node.id(),
                                 "Bias spatial[2]",

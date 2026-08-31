@@ -161,6 +161,7 @@ private:
     void fuse_constant_transposes(program& p);
     void optimize_fused_ops(program& p);
     void remove_redundant_reshape(program& p);
+    void fuse_quantize_depthwise_convolution(program& p);
 };
 
 class pre_replace_deconv : public base_pass {
