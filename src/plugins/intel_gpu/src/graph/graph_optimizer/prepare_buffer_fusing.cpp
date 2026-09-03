@@ -419,6 +419,30 @@ static bool requires_contiguous_input(const program_node& node) {
     return node.is_type<scaled_dot_product_attention>();
 }
 
+// Dynamic padding introduced by in-place crop propagates transitively through nodes that
+// are themselves optimized out (reshape, redundant reorder, ...). So the check cannot stop
+// at the direct users: walk down until the first node that is actually executed, and test
+// that one.
+bool crop_in_place_optimization::has_contiguous_input_consumer(const program_node& node) {
+    std::vector<const program_node*> stack(node.get_users().begin(), node.get_users().end());
+    std::set<const program_node*> visited;
+
+    while (!stack.empty()) {
+        const auto* user = stack.back();
+        stack.pop_back();
+        if (!visited.insert(user).second)
+            continue;
+
+        if (requires_contiguous_input(*user))
+            return true;
+
+        // Node is optimized out -> padding is forwarded to its own users, keep walking.
+        if (user->can_be_optimized())
+            stack.insert(stack.end(), user->get_users().begin(), user->get_users().end());
+    }
+    return false;
+}
+
 bool crop_in_place_optimization::can_crop_be_optimized_along_feature(const layout& crop_layout,
                                                                      const layout& input_layout) {
     auto format = crop_layout.format;
@@ -501,6 +525,10 @@ bool crop_in_place_optimization::match(const program_node& node,
                                        kernel_impl_params& crop_params,
                                        layout& input_layout,
                                        bool is_runtime) {
+    if (has_contiguous_input_consumer(node)) {
+        return false;
+    }
+
     if (!node.is_valid_output_layout())
         return false;
     // if the node is marked as network output, prevent optimizations which would affect a form of its output,
@@ -739,12 +767,6 @@ bool crop_in_place_optimization::update_in_place_crop_padding_along_feature(cons
             // scaling cannot be represented on the L (batch) axis.
             const bool is_axis1_size1_squeeze = reshape_mode == reshape::reshape_mode::base && crop_axis == 1 && crop_dim_val == 1 &&
                                                 reshape_ps.size() + 1 == crop_ps.size() && reshape_ps.size() >= 2 && reshape_ps[1].is_static();
-
-            const auto& reshape_users = user_info.first->get_users();
-            const bool feeds_unsafe_consumer = std::any_of(reshape_users.begin(), reshape_users.end(),
-                [](const program_node* user) { return requires_contiguous_input(*user); });
-            if (feeds_unsafe_consumer)
-                return false;
 
             if (is_axis1_size1_squeeze) {
                 const auto h_size = reshape_ps[1].get_length();

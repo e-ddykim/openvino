@@ -2014,7 +2014,8 @@ void primitive_inst::do_runtime_in_place_crop() {
                     // correct padded view — same as the simple_data_format path does below.
                     if (user_info.first) {
                         const auto* reshape_inst_node = static_cast<const reshape_node*>(user_info.first);
-                        if (!reshape_inst_node->is_runtime_propagatable_padding()) {
+                        if (!reshape_inst_node->is_runtime_propagatable_padding() ||
+                            crop_in_place_optimization::has_contiguous_input_consumer(u->get_node())) {
                             u->set_can_be_optimized(false);
                             GPU_DEBUG_TRACE_DETAIL << "[In place crop] " << u->id() << " cannot be optimized " << std::endl;
                             continue;

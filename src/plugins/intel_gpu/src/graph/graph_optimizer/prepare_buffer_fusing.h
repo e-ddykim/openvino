@@ -66,6 +66,7 @@ struct crop_in_place_optimization : pattern_match_optimization_typed<crop_in_pla
 
     static bool can_crop_be_optimized_along_feature(const layout& crop_layout,
                                                     const layout& input_layout);
+    static bool has_contiguous_input_consumer(const program_node& node);
     static bool can_crop_be_optimized_simple_data_format(const layout& crop_layout,
                                                          const layout& input_layout);
     bool match(crop_node& node);
