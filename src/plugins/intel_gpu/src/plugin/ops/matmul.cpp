@@ -71,7 +71,7 @@ static void CreateMatMulOp(ProgramBuilder& p, const std::shared_ptr<ov::op::v0::
         // (see get_gemm_primitive_descriptor in impls/onednn/gemm_onednn.cpp), so a materialized
         // permute is pure data movement. The heuristics below target the OCL gemm_tiled_opt
         // kernel, which is not selected when oneDNN is available.
-        if (p.get_engine().get_device_info().supports_immad)
+        if (p.get_engine().get_device_info().supports_immad && type != ov::element::f32)
             return false;
 
         // don't transpose inputs if they're aligned to 16
