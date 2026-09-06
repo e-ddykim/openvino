@@ -144,6 +144,9 @@ static void optimize_conv_reshape_reorder(program_node& node) {
     if (!format::is_default_format(reorder_layout.format))
         return;
 
+    if (conv_layout.get_rank() != reorder_layout.format.dimension())
+        return;
+
     if (conv_layout.data_type != reorder_layout.data_type)
         return;
 
