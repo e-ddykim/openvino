@@ -45,6 +45,7 @@
 #include "group_normalization_inst.h"
 #include "lora_inst.h"
 #include "broadcast_inst.h"
+#include "impls/ocl/kernel_selector_helper.h"
 #include <vector>
 #include <map>
 #include <list>
@@ -1267,6 +1268,17 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
 
             auto* fused_node = parents[fused_idx].first;
             auto* peer_node = parents[peer_idx].first;
+
+            // A higher-rank fused eltwise peer must be representable at the fused node's rank,
+            // otherwise canonicalize_fused_shapes() (and the fused-op kernel) would index the peer
+            // with the host's iteration space. For static shapes, decline the fusion here so the
+            // peer runs as its own primitive; dynamic shapes are handled by is_valid_fusion().
+            const auto& host_layout = fused_node->get_output_layout();
+            const auto& peer_layout = peer_node->get_output_layout();
+            if (host_layout.is_static() && peer_layout.is_static() && peer_layout.get_rank() > host_layout.get_rank() &&
+                !fold_higher_rank_fused_peer(peer_layout, host_layout).has_value()) {
+                return;
+            }
 
             // Avoid fusing with GEMM from the LoRA pattern, that can be optimized in case of empty adapters
             if (fused_node->is_type<gemm>()) {

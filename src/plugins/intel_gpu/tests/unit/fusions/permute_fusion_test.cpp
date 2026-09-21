@@ -1313,3 +1313,91 @@ INSTANTIATE_TEST_SUITE_P(collapse6d_matrix,
                          [](const ::testing::TestParamInfo<collapse6d_case>& info) {
                              return std::string(info.param.label);
                          });
+
+// -----------------------------------------------------------------------------
+// Static unfoldable higher-rank peer: host rank < 3 so fold_higher_rank_fused_peer()
+// cannot produce a lower-rank representation. fuse_eltwise_f must decline the fusion
+// (so the peer runs as its own primitive) instead of letting the fused-op kernel read
+// the peer with the host's iteration space, and canonicalize_fused_shapes must not
+// assert. Without the fuse_eltwise_f guard this model fails to load on GPU.
+// -----------------------------------------------------------------------------
+TEST(permute_fused_collapse_unfoldable_peer, rank2_host_rank5_peer_declines_fusion) {
+    ov::Core core;
+    if (!discover_gpu_and_cpu(core)) {
+        GTEST_SKIP() << "Requires both GPU and CPU plugins discoverable via ov::Core.";
+    }
+
+    // host: [10,6] -> permute [1,0] -> [6,10] (rank 2, fusible permute node)
+    // peer: [1,2,8,6,10] (rank 5, independent branch)
+    // Add(host_rank2, peer_rank5) numpy-broadcasts to [1,2,8,6,10].
+    const int64_t K = 12;
+    auto make_branch = [&](const std::shared_ptr<ov::op::v0::Parameter>& param, const std::vector<float>& w, const char* name) {
+        const int64_t f = 2, z = 8, y = 6, x = 10;
+        auto to5d = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{5}, std::vector<int64_t>{1, f, y, x, K});
+        auto reshape5d = std::make_shared<ov::op::v1::Reshape>(param, to5d, false);
+        std::vector<ov::float16> wz(static_cast<size_t>(K * z));
+        for (size_t i = 0; i < wz.size(); ++i)
+            wz[i] = static_cast<ov::float16>(w[i % w.size()]);
+        auto weights = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{static_cast<size_t>(K), static_cast<size_t>(z)}, wz);
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(reshape5d, weights, false, false);
+        auto order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{5}, {0, 1, 4, 2, 3});
+        auto transpose = std::make_shared<ov::op::v1::Transpose>(matmul, order);  // [1,f,z,y,x]
+        transpose->set_friendly_name(name);
+        return transpose;
+    };
+
+    auto in1 = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{10, 6});
+    auto in2 = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{1, 2, 60, 12});
+    in1->set_friendly_name("input1");
+    in2->set_friendly_name("input2");
+
+    // Host: a fusible permute whose own output rank is 2 (< 3 -> no fold possible).
+    auto host_order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {1, 0});
+    auto host = std::make_shared<ov::op::v1::Transpose>(in1, host_order);  // [6, 10], rank 2
+    host->set_friendly_name("Transpose_host");
+
+    auto peer = make_branch(in2, kFusedPeerFoldWeights2, "Transpose_peer");  // [1,2,8,6,10], rank 5
+
+    auto add = std::make_shared<ov::op::v1::Add>(host, peer);  // numpy broadcast -> [1,2,8,6,10]
+    add->set_friendly_name("Add_unfoldable_peer");
+
+    auto result = std::make_shared<ov::op::v0::Result>(add);
+    auto model = std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{in1, in2}, "rank2_host_rank5_peer");
+
+    ov::Tensor in1_t(ov::element::f16, ov::Shape{10, 6});
+    ov::Tensor in2_t(ov::element::f16, ov::Shape{1, 2, 60, 12});
+    {
+        tests::random_generator rg;
+        rg.set_seed(GET_SUITE_NAME);
+        auto rnd1 = rg.generate_random_1d<ov::float16>(in1_t.get_size(), -2, 2);
+        std::copy(rnd1.begin(), rnd1.end(), in1_t.data<ov::float16>());
+        auto rnd2 = rg.generate_random_1d<ov::float16>(in2_t.get_size(), -2, 2);
+        std::copy(rnd2.begin(), rnd2.end(), in2_t.data<ov::float16>());
+    }
+
+    // Compile and infer on CPU as reference.
+    auto [cpu_vals, cpu_compiled] = compile_and_infer(core, "CPU", {}, model, in1_t, in2_t);
+    (void)cpu_compiled;
+
+    // GPU must compile (no assert in canonicalize_fused_shapes) and match CPU.
+    std::vector<float> gpu_vals;
+    ov::CompiledModel gpu_compiled;
+    ASSERT_NO_THROW({
+        auto res = compile_and_infer(core, "GPU", {}, model, in1_t, in2_t);
+        gpu_vals = res.first;
+        gpu_compiled = res.second;
+    }) << "GPU compilation must not fail for unfoldable rank-2 host / rank-5 peer.";
+
+    // The unfoldable rank-5 peer must NOT have been fused into the rank-2 host: the add
+    // survives as its own runtime node rather than being absorbed into Transpose_host.
+    auto rt = gpu_compiled.get_runtime_model();
+    auto host_node = probe_node(rt, {"Transpose_host", "Add_unfoldable_peer"});
+    EXPECT_FALSE(host_node.found) << "Unfoldable rank-5 peer must not be fused into the rank-2 host.";
+
+    ASSERT_EQ(gpu_vals.size(), cpu_vals.size());
+    for (float v : gpu_vals)
+        ASSERT_TRUE(std::isfinite(v)) << "Non-finite GPU output for unfoldable rank-2 host / rank-5 peer.";
+    double max_ae = 0.0;
+    double mse = fused_peer_fold_mse(gpu_vals, cpu_vals, max_ae);
+    EXPECT_LT(mse, 1e-2) << "GPU vs CPU mismatch for unfoldable rank-2 host / rank-5 peer." << " MSE=" << mse << " MaxAbsErr=" << max_ae;
+}
