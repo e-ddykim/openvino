@@ -15,6 +15,8 @@
 #include "openvino/op/result.hpp"
 #include "openvino/pass/manager.hpp"
 
+#include <limits>
+
 
 namespace ov::test::intel_gpu {
 namespace {
@@ -84,8 +86,14 @@ std::shared_ptr<ov::Model> make_gqa_model(const GQAConfig& cfg) {
         parameters.push_back(head_sink);
     }
     if (cfg.kv_cache_bit_width) {
-        auto key_scale = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1});
-        auto value_scale = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1});
+        // ONNX Runtime's GQA schema feeds per-channel KV scales as a flat
+        // [kv_num_heads * head_size] tensor (no reshape on import). PER_TENSOR
+        // uses a single scalar.
+        const auto scale_shape = cfg.kv_quant == QuantType::PER_CHANNEL
+                                     ? ov::PartialShape{kv_num_heads * head_size}
+                                     : ov::PartialShape{1};
+        auto key_scale = std::make_shared<ov::op::v0::Parameter>(f32, scale_shape);
+        auto value_scale = std::make_shared<ov::op::v0::Parameter>(f32, scale_shape);
         inputs[12] = key_scale;
         inputs[13] = value_scale;
         parameters.push_back(key_scale);
@@ -240,6 +248,36 @@ TEST(GroupQueryAttentionDecompositionTest, int4_kv_uses_logical_u4_with_byte_bac
     EXPECT_EQ(sdpa->get_quantization_attrs().quantization_dt, ov::element::u4);
     EXPECT_EQ(sdpa->input_value(1).get_element_type(), ov::element::u8);
     EXPECT_EQ(sdpa->input_value(2).get_element_type(), ov::element::u8);
+}
+
+// PER_CHANNEL KV scales arrive from ONNX as a flat [kv_num_heads * head_size]
+// tensor. The decomposition must reshape them to [1, kv_num_heads, 1, head_size]
+// before wiring them into the compressed SDPA (mirroring make_kv_scale on the
+// dequantize path) and classify the quantization as per-channel, not per-token.
+// The current code passes the raw scale through, so this is a regression repro:
+//   - compute_kv_group_sizes() sees a rank mismatch and falls back to per-token
+//     ({1, 1, 1, UINT64_MAX} instead of {1, 1, UINT64_MAX, 1}),
+//   - v13::shape_infer() demands "Scale input must be scalar or have 1 element"
+//     for the 5-input form and throws.
+TEST(GroupQueryAttentionDecompositionTest, per_channel_kv_scale_shape) {
+    GQAConfig cfg;
+    cfg.kv_cache_bit_width = 8;
+    cfg.kv_quant = QuantType::PER_CHANNEL;
+    cfg.out_quant = QuantType::PER_CHANNEL;
+
+    const auto sdpa = decompose_and_get_sdpa(cfg);
+
+    ASSERT_NE(sdpa, nullptr);
+    ASSERT_TRUE(sdpa->get_kv_compressed());
+    // channel-wise grouping: only the head_size dim is compressed.
+    EXPECT_EQ(sdpa->get_quantization_attrs().group_sizes,
+              (std::vector<uint64_t>{1, 1, std::numeric_limits<uint64_t>::max(), 1}));
+    // The scales must reach the SDPA op broadcastable as [1, kv_num_heads, 1, head_size].
+    const size_t num_data_inputs = sdpa->get_input_size() - sdpa->get_compression_inputs_num();
+    EXPECT_EQ(sdpa->input_value(num_data_inputs).get_partial_shape(),
+              ov::PartialShape({1, kv_num_heads, 1, head_size}));
+    EXPECT_EQ(sdpa->input_value(num_data_inputs + 1).get_partial_shape(),
+              ov::PartialShape({1, kv_num_heads, 1, head_size}));
 }
 
 // A sliding-window cache retains the explicit attention mask.
