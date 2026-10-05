@@ -545,6 +545,35 @@ TEST_F(TransformationTestsF, FullyConnectedHorizontalFusion_u3_misaligned_weight
     comparator.enable(FunctionsComparator::ATTRIBUTES);
 }
 
+TEST_F(TransformationTestsF, FullyConnectedHorizontalFusion_add_bias_unfoldable_zp_no_mutation) {
+    // Issue reproducer: with Add-derived biases, the pass rewires the graph (clones each FC with the
+    // Add's bias constant and replaces the Add output) BEFORE folding/validating the zero points.
+    // Here the zero points are u3 tensors with a K=4 row (12 bits per row), so Concat along axis 0
+    // cannot be byte-aligned and concat_and_fold(zp_nodes, 0, ...) fails. The callback then returns
+    // false AFTER the graph was modified: the original FCs survive, but their bias Adds have been
+    // bypassed, silently changing the model. The graph must remain identical to the
+    // pre-transformation model (model_ref) - including the Add nodes.
+    auto make_model = []() {
+        auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 7, 4096});
+        ov::ResultVector results;
+        for (size_t n : {1024, 512, 128}) {
+            auto weight = std::make_shared<ov::op::v0::Constant>(ov::element::u4, ov::Shape{n, 4096});
+            auto bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
+            auto scale = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{n, 32});
+            auto zp = std::make_shared<ov::op::v0::Constant>(ov::element::u3, ov::Shape{1, 1, 4});
+            auto fc = std::make_shared<ov::intel_gpu::op::FullyConnectedCompressed>(input, weight, bias, scale, zp);
+            auto add_input = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{1, n});
+            auto add = std::make_shared<ov::op::v1::Add>(fc, add_input);
+            results.push_back(std::make_shared<ov::op::v0::Result>(add));
+        }
+        return std::make_shared<ov::Model>(results, ov::ParameterVector{input});
+    };
+    model = make_model();
+    model_ref = make_model();
+    manager.register_pass<FullyConnectedHorizontalFusion>();
+    comparator.enable(FunctionsComparator::ATTRIBUTES);
+}
+
 }  // namespace intel_gpu
 }  // namespace test
 }  // namespace ov
