@@ -3248,6 +3248,59 @@ void test_compressed_int4_scale_dynamic_batch_gemv(bool is_caching_test,
         }
     }
 
+    void test_compressed_int8_broadcast_scale_zp(const std::string& kernel_name, bool is_caching_test, bool transpose_parameters) {
+        auto& engine = get_test_engine();
+        if (!engine.get_device_info().supports_fp16) {
+            GTEST_SKIP() << "The test requires FP16 support.";
+        }
+
+        constexpr int64_t ofm = 3;
+        constexpr int64_t ifm = 32;
+        constexpr int64_t groups = 2;
+        const auto param_shape = transpose_parameters ? ov::PartialShape{1, groups} : ov::PartialShape{groups, 1};
+
+        auto input_mem = engine.allocate_memory({{1, 2, ifm}, data_types::f16, format::bfyx});
+        auto weights_mem = engine.allocate_memory({{ofm, ifm}, data_types::u8, format::bfyx});
+        auto scale_mem = engine.allocate_memory({param_shape, data_types::f16, format::bfyx});
+        auto zp_mem = engine.allocate_memory({param_shape, data_types::u8, format::bfyx});
+        set_values<ov::float16>(input_mem, std::vector<ov::float16>(2 * ifm, ov::float16(1.0f)));
+        set_values<uint8_t>(weights_mem, std::vector<uint8_t>(ofm * ifm, 3));
+        set_values<ov::float16>(scale_mem, {2.0f, 3.0f});
+        set_values<uint8_t>(zp_mem, {1, 2});
+
+        auto fc_prim = fully_connected("fc_prim",
+                                       input_info("input"),
+                                       "weights",
+                                       "",
+                                       "scale",
+                                       "zp",
+                                       data_types::f16,
+                                       3,
+                                       2,
+                                       true,
+                                       transpose_parameters,
+                                       transpose_parameters);
+        topology topology(input_layout("input", input_mem->get_layout()), data("weights", weights_mem), data("scale", scale_mem), data("zp", zp_mem), fc_prim);
+        auto config = get_test_default_config(engine);
+        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+        config.set_property(ov::intel_gpu::optimize_data(true));
+        config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"fc_prim", {format::bfyx, kernel_name, impl_types::ocl}}}));
+
+        auto network = get_network(engine, topology, config, get_test_stream_ptr(), is_caching_test);
+        network->set_input_data("input", input_mem);
+        auto outputs = network->execute();
+        ASSERT_EQ(outputs.size(), size_t{1});
+        auto output_mem = outputs.at("fc_prim").get_memory();
+        cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output_mem, get_test_stream());
+        ASSERT_EQ((ov::PartialShape{1, 2, ofm}), output_mem->get_layout().get_partial_shape());
+        ASSERT_EQ(output_ptr.size(), size_t{2 * ofm});
+
+        // Both groups broadcast across all output channels: 16*(3-1)*2 + 16*(3-2)*3 = 112.
+        for (size_t i = 0; i < output_ptr.size(); ++i) {
+            EXPECT_EQ(ov::float16(112.0f), output_ptr[i]) << "i = " << i;
+        }
+    }
+
     void test_dynamic(bool is_caching_test) {
         auto& engine = get_test_engine();
 
@@ -5746,6 +5799,28 @@ TEST_F(fully_connected_gpu_tests, compressed_int8_scale_zp_scalar) {
 TEST_F(fully_connected_gpu_tests, compressed_int8_transpose_scale_zp) {
     this->test_compressed_int8_transpose_scale_zp(true);
 }
+
+using CompressedFcBroadcastParams = std::tuple<std::string, bool, bool>;
+
+class fully_connected_gpu_compressed_broadcast : public fully_connected_gpu_tests, public ::testing::WithParamInterface<CompressedFcBroadcastParams> {
+public:
+    static std::string getTestCaseName(const ::testing::TestParamInfo<CompressedFcBroadcastParams>& info) {
+        const auto& [kernel_name, caching, transpose_parameters] = info.param;
+        return kernel_name + (caching ? "_Cached" : "_Uncached") + (transpose_parameters ? "_TransposedParameters" : "_NonTransposedParameters");
+    }
+};
+
+TEST_P(fully_connected_gpu_compressed_broadcast, compressed_int8_scale_zp_broadcast_output_channels) {
+    const auto& [kernel_name, caching, transpose_parameters] = GetParam();
+    this->test_compressed_int8_broadcast_scale_zp(kernel_name, caching, transpose_parameters);
+}
+
+INSTANTIATE_TEST_SUITE_P(smoke,
+                         fully_connected_gpu_compressed_broadcast,
+                         ::testing::Combine(::testing::Values("fully_connected_gpu_bfyx_ref", "fully_connected_gpu_bf_tiled"),
+                                            ::testing::Bool(),
+                                            ::testing::Bool()),
+                         fully_connected_gpu_compressed_broadcast::getTestCaseName);
 
 TEST_F(fully_connected_gpu_tests, compressed_int8_scale_b1) {
     this->test_compressed_int8_scale(false, true, 1, false, false);
