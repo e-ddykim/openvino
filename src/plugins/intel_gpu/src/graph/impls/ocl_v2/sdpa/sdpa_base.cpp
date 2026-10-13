@@ -228,6 +228,12 @@ JitConstants SDPABase::get_jit_constants(const kernel_impl_params& params) const
         jit.make("BROADCAST_GROUP_SIZE", 1);
     }
 
+    // sdpa_opt.cl accumulates loaded/dequantized K and V against the Q/output compute type.
+    // When the KV dtypes differ from Q's, the accumulate arguments must be converted explicitly
+    // (e.g. f32 Q with f16 KV); otherwise the mixed-type mad fails to compile.
+    jit.make("KV_COMPUTE_MISMATCH", (params.input_layouts[0].data_type != params.input_layouts[1].data_type ||
+                                     params.input_layouts[0].data_type != params.input_layouts[2].data_type) ? 1 : 0);
+
     if (params.is_type<scaled_dot_product_attention>()) {
         const auto& desc = params.typed_desc<scaled_dot_product_attention>();
         auto data_inputs_num = get_data_inputs_num(*desc);

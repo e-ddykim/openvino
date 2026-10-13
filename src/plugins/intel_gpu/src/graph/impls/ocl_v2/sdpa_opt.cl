@@ -157,6 +157,18 @@ inline uint FUNC(get_bt_index_value)(OPTIONAL_SHAPE_INFO_ARG uint b, uint f, uin
 #else
     #define DEQUANTIZE_KV(value, zp, scale) ((value) * (scale))
 #endif
+    // Dequantized KV is computed in the compression scale type (f16), so it must be converted to
+    // the Q/output compute type before the mad accumulate when the compute type is wider (e.g. f32 Q).
+    #define MAD_KEY_ARG(v) TO_INPUT0_COMPUTE_TYPE(v)
+    #define MAD_VALUE_ARG(v) TO_OUTPUT_COMPUTE_TYPE(v)
+#elif KV_COMPUTE_MISMATCH
+    // Uncompressed KV whose dtype differs from Q's (e.g. f32 Q with f16 KV) needs the same conversion.
+    #define MAD_KEY_ARG(v) TO_INPUT0_COMPUTE_TYPE(v)
+    #define MAD_VALUE_ARG(v) TO_OUTPUT_COMPUTE_TYPE(v)
+#else
+    // Uncompressed KV is already loaded in the compute type; leave the accumulate untouched.
+    #define MAD_KEY_ARG(v) (v)
+    #define MAD_VALUE_ARG(v) (v)
 #endif
 
 #ifdef SDPA_STAGE_0
@@ -1717,8 +1729,8 @@ KERNEL(sdpa_opt)(
                             KEY_COMPRESSION_SCALE_TYPE key_lo = DEQUANTIZE_KV(TO_KEY_COMPRESSION_SCALE_TYPE(DECODE_INT4_NIBBLE(unpacked.s0)), sub_group_broadcast(comp_zp, key_row_idx), sub_group_broadcast(comp_scale, key_row_idx));
                             KEY_COMPRESSION_SCALE_TYPE key_hi = DEQUANTIZE_KV(TO_KEY_COMPRESSION_SCALE_TYPE(DECODE_INT4_NIBBLE(unpacked.s1)), sub_group_broadcast(comp_zp, key_row_idx), sub_group_broadcast(comp_scale, key_row_idx));
                             unroll_for (uint i = 0; i < SUBGROUP_SIZE; i++) {
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_lo, i), qvec_lo[i], qk_acc[key_row_idx]);
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_hi, i), qvec_hi[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_lo, i)), qvec_lo[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_hi, i)), qvec_hi[i], qk_acc[key_row_idx]);
                             }
                         }
                     }
@@ -1749,8 +1761,8 @@ KERNEL(sdpa_opt)(
                             key_lo *= lo_mask;
                             key_hi *= hi_mask;
                             unroll_for (uint i = 0; i < SUBGROUP_SIZE; i++) {
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_lo, i), qvec_lo[i], qk_acc[key_row_idx]);
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_hi, i), qvec_hi[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_lo, i)), qvec_lo[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_hi, i)), qvec_hi[i], qk_acc[key_row_idx]);
                             }
                         }
                     }
@@ -1786,7 +1798,7 @@ KERNEL(sdpa_opt)(
 #endif
 
                         unroll_for (uint i = 0; i < SUBGROUP_SIZE; i++) {
-                            qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+                            qk_acc[key_row_idx] = mad(MAD_KEY_ARG(sub_group_broadcast(key_vals, i)), queries_vec[i], qk_acc[key_row_idx]);
                         }
                     }
                 }
@@ -1811,7 +1823,7 @@ KERNEL(sdpa_opt)(
                         INPUT1_COMPUTE_TYPE key_vals = DECODE_INPUT1_COMPUTE_TYPE(key_packed);
 #endif
                         unroll_for (uint i = 0; i < K_HEAD_SIZE_LEFTOVER; i++) {
-                            qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+                            qk_acc[key_row_idx] = mad(MAD_KEY_ARG(sub_group_broadcast(key_vals, i)), queries_vec[i], qk_acc[key_row_idx]);
                         }
                     }
                 #endif
@@ -1850,8 +1862,8 @@ KERNEL(sdpa_opt)(
                                 key_hi = DEQUANTIZE_KV(TO_KEY_COMPRESSION_SCALE_TYPE(DECODE_INT4_NIBBLE(unpacked.s1)), sub_group_broadcast(comp_zp, key_row_idx), sub_group_broadcast(comp_scale, key_row_idx));
                             }
                             unroll_for (uint i = 0; i < SUBGROUP_SIZE; i++) {
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_lo, i), qvec_lo[i], qk_acc[key_row_idx]);
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_hi, i), qvec_hi[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_lo, i)), qvec_lo[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_hi, i)), qvec_hi[i], qk_acc[key_row_idx]);
                             }
                         }
                     }
@@ -1886,8 +1898,8 @@ KERNEL(sdpa_opt)(
                             key_lo *= lo_mask;
                             key_hi *= hi_mask;
                             unroll_for (uint i = 0; i < SUBGROUP_SIZE; i++) {
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_lo, i), qvec_lo[i], qk_acc[key_row_idx]);
-                                qk_acc[key_row_idx] = mad(sub_group_broadcast(key_hi, i), qvec_hi[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_lo, i)), qvec_lo[i], qk_acc[key_row_idx]);
+                                qk_acc[key_row_idx] = mad(TO_INPUT0_COMPUTE_TYPE(sub_group_broadcast(key_hi, i)), qvec_hi[i], qk_acc[key_row_idx]);
                             }
                         }
                     }
@@ -1952,7 +1964,7 @@ KERNEL(sdpa_opt)(
                         #define key_vals key_vec[key_row_idx]
 #endif  // !defined(LOAD_KEY_LEFTOVERS_IN_CALC_LOOP)
                         unroll_for (uint i = 0; i < SUBGROUP_SIZE; i++) {
-                            qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+                            qk_acc[key_row_idx] = mad(MAD_KEY_ARG(sub_group_broadcast(key_vals, i)), queries_vec[i], qk_acc[key_row_idx]);
                         }
                     }
                 }
@@ -1977,7 +1989,7 @@ KERNEL(sdpa_opt)(
                         INPUT1_COMPUTE_TYPE key_val = DECODE_INPUT1_COMPUTE_TYPE(key_packed);
 #endif
                         unroll_for (uint i = 0; i < K_HEAD_SIZE_LEFTOVER; i++) {
-                            qk_acc[key_row_idx] = mad(sub_group_broadcast(key_val, i), queries_vec[i], qk_acc[key_row_idx]);
+                            qk_acc[key_row_idx] = mad(MAD_KEY_ARG(sub_group_broadcast(key_val, i)), queries_vec[i], qk_acc[key_row_idx]);
                         }
                     }
                 #endif // K_HEAD_SIZE_LEFTOVER
@@ -2360,7 +2372,7 @@ KERNEL(sdpa_opt)(
                         INPUT2_COMPUTE_TYPE value_val = DECODE_INPUT2_COMPUTE_TYPE(value_packed);
                         #endif
                         unroll_for (uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
-                            acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), value_val, acc_output_res[seq_idx]);
+                            acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), MAD_VALUE_ARG(value_val), acc_output_res[seq_idx]);
                         }
                         #ifndef BEAM_TABLE_TYPE
                         value_offset += value_pitch;
@@ -2390,7 +2402,7 @@ KERNEL(sdpa_opt)(
                             INPUT2_COMPUTE_TYPE value_val = DECODE_INPUT2_COMPUTE_TYPE(value_packed);
                         #endif
                             unroll_for (uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
-                                acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), value_val, acc_output_res[seq_idx]);
+                                acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), MAD_VALUE_ARG(value_val), acc_output_res[seq_idx]);
                             }
                         #ifndef BEAM_TABLE_TYPE
                             value_offset += value_pitch;
@@ -2481,7 +2493,7 @@ KERNEL(sdpa_opt)(
                         INPUT2_COMPUTE_TYPE value_val = DECODE_INPUT2_COMPUTE_TYPE(value_packed);
                 #endif
                         unroll_for (uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
-                            acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), value_val, acc_output_res[seq_idx]);
+                            acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), MAD_VALUE_ARG(value_val), acc_output_res[seq_idx]);
                         }
                 #ifndef BEAM_TABLE_TYPE
                         value_offset += value_pitch;
@@ -2511,7 +2523,7 @@ KERNEL(sdpa_opt)(
                             INPUT2_COMPUTE_TYPE value_val = DECODE_INPUT2_COMPUTE_TYPE(value_packed);
                         #endif
                             unroll_for (uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
-                                acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), value_val, acc_output_res[seq_idx]);
+                                acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), MAD_VALUE_ARG(value_val), acc_output_res[seq_idx]);
                             }
                         #ifndef BEAM_TABLE_TYPE
                             value_offset += value_pitch;
@@ -2606,7 +2618,7 @@ KERNEL(sdpa_opt)(
 #endif
 
                         for (uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
-                            acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], seq_len_idx), value_val, acc_output_res[seq_idx]);
+                            acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], seq_len_idx), MAD_VALUE_ARG(value_val), acc_output_res[seq_idx]);
                         }
 
 #ifndef BEAM_TABLE_TYPE
