@@ -2395,7 +2395,8 @@ KERNEL(sdpa_opt)(
                 uint seq_len_end = 0;
                 if (seq_len_start < partition_seq_len)
                     seq_len_end = seq_len_start + min(partition_seq_len - seq_len_start, (uint)(SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR));;
-                for (uint seq_len = seq_len_start / SUBGROUP_SIZE; seq_len < seq_len_end / SUBGROUP_SIZE; seq_len++) {
+                // Keep the induction variable in token rows, as in the full-partition path.
+                for (uint seq_len = seq_len_start; seq_len < (seq_len_end / SUBGROUP_SIZE) * SUBGROUP_SIZE; seq_len += SUBGROUP_SIZE) {
             #if IS_PAGED_ATTENTION
                 #ifdef BROADCAST_GROUP_SIZE
                     const uint heads_dim = num_heads_dim / BROADCAST_GROUP_SIZE;
@@ -2406,30 +2407,30 @@ KERNEL(sdpa_opt)(
                     uint value_offset = INPUT2_OFFSET +
                                         value_seq_offset * value_pitch +
                                         heads_dim * V_HEAD_SIZE +
-                                        (start_partition_idx + (seq_len * SUBGROUP_SIZE)) * value_pitch + head_size_idx;
+                                        (start_partition_idx + seq_len) * value_pitch + head_size_idx;
             #else // !IS_PAGED_ATTENTION
                 #ifdef BEAM_TABLE_TYPE
     #if IS_INT4_COMPRESSED
-                    const uint b_idx = beam_table[FUNC_CALL(get_bt_index_value)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx, b1_idx, 0, 0, start_partition_idx + (seq_len * SUBGROUP_SIZE) + sglid, val_packed_x_s1)];
-                    uint value_offset = FUNC_CALL(get_input2_index)(OPTIONAL_SHAPE_INFO_TENSOR b_idx, b1_idx, 0, 0, start_partition_idx + (seq_len * SUBGROUP_SIZE) + sglid, val_packed_x_s1);
+                    const uint b_idx = beam_table[FUNC_CALL(get_bt_index_value)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx, b1_idx, 0, 0, start_partition_idx + seq_len + sglid, val_packed_x_s1)];
+                    uint value_offset = FUNC_CALL(get_input2_index)(OPTIONAL_SHAPE_INFO_TENSOR b_idx, b1_idx, 0, 0, start_partition_idx + seq_len + sglid, val_packed_x_s1);
     #else
-                    const uint b_idx = beam_table[FUNC_CALL(get_bt_index_value)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx, b1_idx, 0, 0, start_partition_idx + (seq_len * SUBGROUP_SIZE) + sglid, sgid * SUBGROUP_SIZE)];
-                    uint value_offset = FUNC_CALL(get_input2_index)(OPTIONAL_SHAPE_INFO_TENSOR b_idx, b1_idx, 0, 0, start_partition_idx + (seq_len * SUBGROUP_SIZE) + sglid, sgid * SUBGROUP_SIZE);
+                    const uint b_idx = beam_table[FUNC_CALL(get_bt_index_value)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx, b1_idx, 0, 0, start_partition_idx + seq_len + sglid, sgid * SUBGROUP_SIZE)];
+                    uint value_offset = FUNC_CALL(get_input2_index)(OPTIONAL_SHAPE_INFO_TENSOR b_idx, b1_idx, 0, 0, start_partition_idx + seq_len + sglid, sgid * SUBGROUP_SIZE);
     #endif
                 #else
                     const uint b_idx = b_v_idx;
                 #if IS_INT4_COMPRESSED
-                    uint value_offset = value_base_s1 + (start_partition_idx + (seq_len * SUBGROUP_SIZE)) * value_pitch;
+                    uint value_offset = value_base_s1 + (start_partition_idx + seq_len) * value_pitch;
                 #elif defined(INPUT2_DIMS_ORDER)
-                    uint value_offset = FUNC_CALL(get_input2_index)(OPTIONAL_SHAPE_INFO_TENSOR b_idx, b1_idx, 0, 0, start_partition_idx + (seq_len * SUBGROUP_SIZE), head_size_idx);
+                    uint value_offset = FUNC_CALL(get_input2_index)(OPTIONAL_SHAPE_INFO_TENSOR b_idx, b1_idx, 0, 0, start_partition_idx + seq_len, head_size_idx);
                 #else
-                    uint value_offset = INPUT2_GET_INDEX(b_idx, b1_idx, start_partition_idx + (seq_len * SUBGROUP_SIZE), head_size_idx);
+                    uint value_offset = INPUT2_GET_INDEX(b_idx, b1_idx, start_partition_idx + seq_len, head_size_idx);
                 #endif
             #endif
 #endif
 
 #if IS_KV_COMPRESSED
-                    const uint comp_offset = GET_COMPRESSION_INDEX(VALUE_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, start_partition_idx + (seq_len * SUBGROUP_SIZE) + sglid, 0);
+                    const uint comp_offset = GET_COMPRESSION_INDEX(VALUE_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, start_partition_idx + seq_len + sglid, 0);
                     VALUE_COMPRESSION_SCALE_TYPE comp_scale = GET_SCALE(val_zp, val_scale, comp_offset);
 #if USE_ASYMMETRIC_QUANTIZATION
                     VALUE_COMPRESSION_SCALE_TYPE comp_zp = GET_ZP(val_zp, val_scale, comp_offset);
@@ -2438,7 +2439,7 @@ KERNEL(sdpa_opt)(
 
                     MAKE_VECTOR_TYPE(OUTPUT_COMPUTE_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_val;
                     unroll_for (uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
-                        qk_val[seq_idx] = slm_qk_vals[seq_idx][seq_len * SUBGROUP_SIZE + sglid];
+                        qk_val[seq_idx] = slm_qk_vals[seq_idx][seq_len + sglid];
                     }
                 #ifdef V_HEAD_SIZE_LEFTOVER
                     // splitting to two cases for supressing reg spill : block_read & eltwise read

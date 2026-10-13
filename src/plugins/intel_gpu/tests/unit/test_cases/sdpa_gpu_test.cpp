@@ -1432,6 +1432,91 @@ INSTANTIATE_TEST_SUITE_P(smoke_sdpa_gpu_gqa_decomp,
                          sdpa_gpu_gqa_decomp_test::PrintToStringParamName);
 #endif
 
+// Uniform logits with distinct token values expose duplicated or omitted KV rows;
+// a constant V alone would hide those errors.
+class sdpa_gpu_short_kv_test : public ::testing::TestWithParam<std::tuple<data_types, bool, int>> {
+public:
+    static std::string PrintToStringParamName(const testing::TestParamInfo<ParamType>& info) {
+        const auto [dt, fa2, seq_kv] = info.param;
+        return std::string(dt == data_types::f16 ? "f16" : "f32") + (fa2 ? "_fa2" : "_no_fa2") + "_kv" + std::to_string(seq_kv);
+    }
+
+protected:
+    template <typename T>
+    void check_token_weights(data_types dt, bool fa2, int seq_kv) {
+        auto& engine = get_test_engine();
+        constexpr int num_heads = 4;
+        constexpr int seq_q = 32;
+        constexpr int head_size = 64;
+        const layout q_layout({1, num_heads, seq_q, head_size}, dt, format::bfyx);
+        const layout kv_layout({1, num_heads, seq_kv, head_size}, dt, format::bfyx);
+        const layout mask_layout{ov::PartialShape{}, dt, format::bfyx};
+        auto q_mem = engine.allocate_memory(q_layout);
+        auto k_mem = engine.allocate_memory(kv_layout);
+        auto v_mem = engine.allocate_memory(kv_layout);
+        auto mask_mem = engine.allocate_memory(mask_layout);
+        set_values(q_mem, std::vector<T>(q_layout.count(), T(0.0f)));
+        set_values(k_mem, std::vector<T>(kv_layout.count(), T(0.0f)));
+        set_values(mask_mem, std::vector<T>{T(0.0f)});
+
+        std::vector<T> values(kv_layout.count(), T(0.0f));
+        for (int h = 0; h < num_heads; ++h) {
+            for (int token = 0; token < seq_kv; ++token) {
+                for (int d = 0; d < head_size; ++d) {
+                    values[(h * seq_kv + token) * head_size + d] = T(d == head_size - 1 || token == d ? 1.0f : 0.0f);
+                }
+            }
+        }
+        set_values(v_mem, values);
+
+        topology topo;
+        topo.add(input_layout("q", q_layout));
+        topo.add(input_layout("k", kv_layout));
+        topo.add(input_layout("v", kv_layout));
+        // A scalar mask excludes micro SDPA even on devices with systolic support.
+        topo.add(input_layout("mask", mask_layout));
+        topo.add(scaled_dot_product_attention("sdpa",
+                                              {input_info("q"), input_info("k"), input_info("v"), input_info("mask")},
+                                              false,
+                                              -1,
+                                              {0, 1, 2, 3},
+                                              {0, 1, 2, 3},
+                                              {0, 1, 2, 3},
+                                              {0, 1, 2, 3}));
+        topo.add(reorder("result", input_info("sdpa"), format::bfyx, data_types::f32));
+        auto cfg = get_test_default_config(engine);
+        cfg.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+        cfg.set_property(ov::intel_gpu::could_use_flashattn_v2(fa2));
+        auto net = get_network(engine, topo, cfg, get_test_stream_ptr(), false);
+        ASSERT_EQ(net->get_primitive("sdpa")->get_impl()->get_kernel_name(), "ocl::sdpa::opt");
+        net->set_input_data("q", q_mem);
+        net->set_input_data("k", k_mem);
+        net->set_input_data("v", v_mem);
+        net->set_input_data("mask", mask_mem);
+        auto output = net->execute().at("result").get_memory();
+        mem_lock<float, mem_lock_type::read> output_ptr(output, get_test_stream());
+        ASSERT_EQ(output_ptr.size(), q_layout.count());
+        for (size_t i = 0; i < output_ptr.size(); ++i) {
+            const auto d = i % head_size;
+            const float expected = d == head_size - 1 ? 1.0f : d < static_cast<size_t>(seq_kv) ? 1.0f / seq_kv : 0.0f;
+            ASSERT_NEAR(expected, output_ptr[i], 1e-3f) << "index " << i;
+        }
+    }
+};
+
+TEST_P(sdpa_gpu_short_kv_test, preserves_token_weights) {
+    const auto [dt, fa2, seq_kv] = GetParam();
+    if (dt == data_types::f16)
+        check_token_weights<ov::float16>(dt, fa2, seq_kv);
+    else
+        check_token_weights<float>(dt, fa2, seq_kv);
+}
+
+INSTANTIATE_TEST_SUITE_P(smoke_sdpa_gpu_short_kv,
+                         sdpa_gpu_short_kv_test,
+                         ::testing::Combine(::testing::Values(data_types::f16, data_types::f32), ::testing::Bool(), ::testing::Values(16, 32, 64, 128)),
+                         sdpa_gpu_short_kv_test::PrintToStringParamName);
+
 enum class sdpa_ref_accuracy_case { uniform_16, uniform_32, uniform_64, nonuniform, nonuniform_33, nonuniform_100, mask, causal };
 
 class sdpa_ref_accuracy_test
