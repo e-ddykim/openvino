@@ -2396,6 +2396,10 @@ KERNEL(sdpa_opt)(
                 if (seq_len_start < partition_seq_len)
                     seq_len_end = seq_len_start + min(partition_seq_len - seq_len_start, (uint)(SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR));;
                 // Keep the induction variable in token rows, as in the full-partition path.
+                // Iterate over full SUBGROUP_SIZE blocks only: the trailing partial block (if any) is
+                // processed once by the "QK*V leftovers processing" below, which starts at
+                // (seq_len_end / SUBGROUP_SIZE) * SUBGROUP_SIZE. Running this loop up to seq_len_end
+                // instead would accumulate the tail keys twice.
                 for (uint seq_len = seq_len_start; seq_len < (seq_len_end / SUBGROUP_SIZE) * SUBGROUP_SIZE; seq_len += SUBGROUP_SIZE) {
             #if IS_PAGED_ATTENTION
                 #ifdef BROADCAST_GROUP_SIZE
