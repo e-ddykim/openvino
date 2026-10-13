@@ -2063,10 +2063,19 @@ KERNEL(sdpa_opt)(
 
                 // softmax
                 SOFTMAX_ACCUMULATOR_TYPE exp_sum_new = SOFTMAX_ACCUMULATOR_VAL_ZERO;
-                for (uint k = sglid; k < partition_seq_len; k += SUBGROUP_SIZE) {
-                    SOFTMAX_ACCUMULATOR_TYPE a = native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[m][k]) - qk_max_new);
-                    slm_qk_vals[m][k] = TO_OUTPUT_COMPUTE_TYPE(a);
-                    exp_sum_new += a;
+                // The strided form of this loop (k = sglid; k < partition_seq_len; k += SUBGROUP_SIZE) produced
+                // wrong published weights and exp_sum on UHD Graphics 770 and Arc A770 when partition_seq_len is
+                // a compile-time constant (observed with static source seq len 17); the codegen mechanism is
+                // unconfirmed. The uniform-trip-count form below visits the same k values per lane in the same
+                // order and fixes the observed error.
+                const uint softmax_iters = CEIL_DIV(partition_seq_len, SUBGROUP_SIZE);
+                for (uint j = 0; j < softmax_iters; j++) {
+                    const uint k = j * SUBGROUP_SIZE + sglid;
+                    if (k < partition_seq_len) {
+                        SOFTMAX_ACCUMULATOR_TYPE a = native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[m][k]) - qk_max_new);
+                        slm_qk_vals[m][k] = TO_OUTPUT_COMPUTE_TYPE(a);
+                        exp_sum_new += a;
+                    }
                 }
                 exp_sum_new = sub_group_reduce_add(exp_sum_new);
 
