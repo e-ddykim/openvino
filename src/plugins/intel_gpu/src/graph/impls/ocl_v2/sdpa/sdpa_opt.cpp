@@ -97,8 +97,10 @@ public:
                     if (!has_stage(regular_micro_multi_tokens)) {
                         OPENVINO_ASSERT(!SDPAOpt::has_per_channel_compressed_kv(params), "Per-channel compressed KV requires the micro SDPA kernel");
                         GPU_DEBUG_TRACE_DETAIL << "fail to create micro kernel, fallback to regular_multi_tokens for prefill \n";
-                        add_stage(regular_multi_tokens, params);
                     }
+                    // execute() excludes INT4 per-token compressed KV from the micro stage, so the regular
+                    // multi-token stage must exist as fallback (mirrors the single-token branch above).
+                    add_stage(regular_multi_tokens, params);
 #endif
                 } else {
                     GPU_DEBUG_TRACE_DETAIL << "add stage regular_multi_tokens kernels with prefill_stage \n";
