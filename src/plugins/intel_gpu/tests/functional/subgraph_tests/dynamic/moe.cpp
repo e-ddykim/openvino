@@ -2,8 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <algorithm>
+#include <cmath>
+
+#include "common_test_utils/file_utils.hpp"
 #include "common_test_utils/node_builders/moe_builders.hpp"
 #include "common_test_utils/ov_tensor_utils.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
+#include "openvino/op/reshape.hpp"
+#include "openvino/op/subtract.hpp"
+#include "openvino/pass/serialize.hpp"
 #include "openvino/runtime/intel_gpu/properties.hpp"
 #include "shared_test_classes/base/ov_subgraph.hpp"
 
@@ -229,6 +238,125 @@ private:
 TEST_P(MoECompressedFusionTest, Inference) {
     run();
 }
+
+using MoECompressedOffloadParams = std::tuple<size_t, ov::element::Type>;
+
+class MoECompressedOffloadTest : public testing::WithParamInterface<MoECompressedOffloadParams>, virtual public ov::test::SubgraphBaseTest {
+public:
+    static std::string getTestCaseName(const testing::TestParamInfo<MoECompressedOffloadParams>& info) {
+        const auto& [offload_ratio, zp_precision] = info.param;
+        std::ostringstream result;
+        result << "OffloadRatio" << offload_ratio << "_ZP" << zp_precision;
+        return result.str();
+    }
+
+protected:
+    void SetUp() override {
+        const auto& [offload_ratio, zp_precision] = GetParam();
+        targetDevice = ov::test::utils::DEVICE_GPU;
+        const auto caps = core->get_property(targetDevice, ov::device::capabilities);
+        if (std::find(caps.begin(), caps.end(), ov::intel_gpu::capability::HW_MATMUL) == caps.end()) {
+            GTEST_SKIP() << "MoE pipeline requires a systolic GPU (HW_MATMUL capability)";
+        }
+        RecordProperty("device", core->get_property(targetDevice, ov::device::full_name));
+        inType = outType = inference_precision = ov::element::f16;
+        abs_threshold = 1e-3;
+        rel_threshold = 0.025;
+        const ov::test::MoePatternParams moe_params{{-1, -1, 256}, 4, 8, 512};
+        init_input_shapes({{moe_params.data_shape, {{1, 40, 256}}}});
+        function = ov::test::initMoE3GeMMSubgraph(moe_params,
+                                                  ov::element::f16,
+                                                  ov::element::u3,
+                                                  true,
+                                                  ov::element::f16,
+                                                  ov::element::f16,
+                                                  ov::test::utils::DecompressionType::full,
+                                                  ov::test::utils::DecompressionType::full,
+                                                  false,  // Keep serialized scales/ZPs in their broadcast shapes.
+                                                  128);
+        size_t zp_count = 0;
+        for (const auto& node : function->get_ops()) {
+            const auto subtract = ov::as_type_ptr<ov::op::v1::Subtract>(node);
+            if (!subtract) {
+                continue;
+            }
+            auto zp_node = subtract->get_input_node_shared_ptr(1);
+            if (const auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(zp_node)) {
+                zp_node = reshape->get_input_node_shared_ptr(0);
+            }
+            const auto convert = ov::as_type_ptr<ov::op::v0::Convert>(zp_node);
+            ASSERT_NE(convert, nullptr);
+            const auto zp = ov::as_type_ptr<ov::op::v0::Constant>(convert->get_input_node_shared_ptr(0));
+            ASSERT_NE(zp, nullptr);
+            ASSERT_EQ(zp->get_element_type(), ov::element::u3);
+            ASSERT_GT(ov::shape_size(zp->get_shape()), 1);
+            if (zp_precision == ov::element::u8) {
+                convert->input(0).replace_source_output(ov::op::v0::Constant::create(zp_precision, zp->get_shape(), zp->cast_vector<uint8_t>()));
+            }
+            ++zp_count;
+        }
+        ASSERT_EQ(zp_count, 4);  // Three expert projections and the router.
+        function->validate_nodes_and_infer_types();
+        functionRefs = function->clone();
+
+        const auto file_prefix = ov::test::utils::generateTestFilePrefix();
+        xml_path = file_prefix + ".xml";
+        bin_path = file_prefix + ".bin";
+        // Reload the original packed constants so OTD receives real file offsets.
+        ov::pass::Serialize(xml_path, bin_path).run_on_model(function);
+        function = core->read_model(xml_path);
+        configuration = {ov::hint::inference_precision(ov::element::f16),
+                         ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY),
+                         ov::hint::dynamic_quantization_group_size(0),
+                         ov::intel_gpu::offload_ratio(offload_ratio),
+                         ov::weights_path(bin_path)};
+    }
+
+    void compile_model() override {
+        ov::test::SubgraphBaseTest::compile_model();
+        ov::test::CheckNumberOfNodesWithType(compiledModel, "moe_3gemm_fused_compressed", 1);
+    }
+
+    void generate_inputs(const std::vector<ov::Shape>& target_input_static_shapes) override {
+        inputs.clear();
+        const auto& parameter = function->get_parameters().at(0);
+        // Bound FP16 accumulation error so this test isolates offloaded constant loading.
+        inputs.insert(
+            {parameter, ov::test::utils::create_and_fill_tensor_normal_distribution(ov::element::f16, target_input_static_shapes.at(0), 0.0f, 0.05f, 1234)});
+    }
+
+    void compare(const std::vector<ov::Tensor>& expected, const std::vector<ov::Tensor>& actual) override {
+        ASSERT_EQ(actual.size(), 1);
+        ASSERT_EQ(actual[0].get_element_type(), ov::element::f16);
+        const auto* data = actual[0].data<const ov::float16>();
+        ASSERT_TRUE(std::all_of(data, data + actual[0].get_size(), [](ov::float16 value) {
+            return std::isfinite(static_cast<float>(value));
+        })) << "MoE output contains non-finite values";
+        ov::test::SubgraphBaseTest::compare(expected, actual);
+    }
+
+    void TearDown() override {
+        ov::test::SubgraphBaseTest::TearDown();
+        inferRequest = {};
+        compiledModel = {};
+        function.reset();
+        functionRefs.reset();
+        ov::test::utils::removeIRFiles(xml_path, bin_path);
+    }
+
+private:
+    std::string xml_path;
+    std::string bin_path;
+};
+
+TEST_P(MoECompressedOffloadTest, Inference) {
+    run();
+}
+
+INSTANTIATE_TEST_SUITE_P(smoke_MoE3GemmCompressedOffload,
+                         MoECompressedOffloadTest,
+                         ::testing::Combine(::testing::Values(size_t{0}, size_t{50}), ::testing::Values(ov::element::u3, ov::element::u8)),
+                         MoECompressedOffloadTest::getTestCaseName);
 
 // GatherMatmul and fused MoE kernels support only f16 activations, so the MoE pipeline must be applied
 // only if the activations are f16 after ConvertPrecision, regardless of OV_GPU_MOE_DISABLE_FUSION.
