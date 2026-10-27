@@ -228,6 +228,7 @@ set(GPU_UNIT_TESTS_SRCS
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/pa_kv_reorder_gpu_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/paged_attention_gpu_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/paged_attention_gpu_test.h
+    ${CMAKE_CURRENT_LIST_DIR}/test_cases/paged_attention_gqa_multi_tokens_regression_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/paged_attention_token_type_gpu_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/paged_causal_conv1d.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/paged_gated_delta_net.cpp
