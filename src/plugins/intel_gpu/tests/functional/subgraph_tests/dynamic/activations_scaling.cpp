@@ -24,7 +24,10 @@
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/transpose.hpp"
+#include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/variadic_split.hpp"
+#include "openvino/op/cos.hpp"
+#include "openvino/op/sin.hpp"
 
 namespace {
 using ov::test::InputShape;
@@ -380,6 +383,139 @@ protected:
 };
 
 TEST_F(ActivationsScalingFakeQuantizeSDPA, smoke_Inference) {
+    core->set_property(targetDevice, ov::hint::activations_scale_factor(8.f));
+    run();
+}
+
+// Per-head RMSNorm before RoPE must stay unfused until activations scaling has absorbed the Q/K MatMul scale_up
+// factor into the RMS epsilon; FuseRMSRoPE then folds the adjusted RMSNorm into the 4-input RoPE primitive.
+class ActivationsScalingRMSRoPE : public ov::test::SubgraphBaseTest {
+protected:
+    static constexpr int64_t num_heads = 4;
+    static constexpr int64_t head_size = 128;
+    static constexpr int64_t hidden_size = num_heads * head_size;
+
+    void SetUp() override {
+        targetDevice = ov::test::utils::DEVICE_GPU;
+        init_input_shapes({{{1, -1, 128}, {{1, 7, 128}, {1, 32, 128}, {1, 1, 128}}},
+                           {{1, -1}, {{1, 7}, {1, 32}, {1, 1}}}});
+        abs_threshold = 0.02f;
+        rel_threshold = 0.02f;
+        configuration.insert(ov::hint::inference_precision(ov::element::f16));
+        convert_precisions.insert({ov::element::f16, ov::element::f32});
+
+        auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, inputDynamicShapes[0]);
+        auto pos_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, inputDynamicShapes[1]);
+
+        std::vector<float> w_vals(128 * hidden_size);
+        for (size_t i = 0; i < w_vals.size(); ++i) {
+            w_vals[i] = 0.5f + static_cast<float>((i * 37 + 13) % 100) / 100.0f;
+        }
+        auto weights = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{128, static_cast<size_t>(hidden_size)}, w_vals);
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights);
+        auto split_heads = std::make_shared<ov::op::v1::Reshape>(
+            matmul,
+            ov::op::v0::Constant::create(ov::element::i64, {4}, std::vector<int64_t>{0, 0, num_heads, head_size}),
+            true);
+
+        auto square = std::make_shared<ov::op::v1::Power>(
+            split_heads,
+            ov::op::v0::Constant::create(ov::element::f16, ov::Shape{}, {2.f}));
+        auto mean = std::make_shared<ov::op::v1::ReduceMean>(
+            square,
+            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}),
+            true);
+        auto denom = std::make_shared<ov::op::v0::Sqrt>(
+            std::make_shared<ov::op::v1::Add>(mean, ov::op::v0::Constant::create(ov::element::f16, ov::Shape{}, {1e-6f})));
+        auto recip = std::make_shared<ov::op::v1::Divide>(
+            ov::op::v0::Constant::create(ov::element::f16, ov::Shape{}, {1.f}),
+            denom);
+        auto norm = std::make_shared<ov::op::v1::Multiply>(split_heads, recip);
+        auto rms = std::make_shared<ov::op::v1::Multiply>(
+            norm,
+            ov::op::v0::Constant::create(ov::element::f16, ov::Shape{static_cast<size_t>(head_size)}, std::vector<float>(head_size, 1.25f)));
+        auto rope_input = std::make_shared<ov::op::v1::Transpose>(
+            rms,
+            ov::op::v0::Constant::create(ov::element::i64, {4}, std::vector<int64_t>{0, 2, 1, 3}));
+
+        std::vector<float> inv_freq(head_size / 2);
+        for (size_t i = 0; i < inv_freq.size(); ++i) {
+            inv_freq[i] = std::pow(1000000.f, -2.f * static_cast<float>(i) / static_cast<float>(head_size));
+        }
+        auto frequencies = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{1, static_cast<size_t>(head_size / 2), 1}, inv_freq);
+        auto axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+        auto positions = std::make_shared<ov::op::v0::Convert>(std::make_shared<ov::op::v0::Unsqueeze>(pos_ids, axis), ov::element::f16);
+        auto angles = std::make_shared<ov::op::v0::MatMul>(frequencies, positions);
+        auto transposed = std::make_shared<ov::op::v1::Transpose>(
+            angles,
+            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {0, 2, 1}));
+        auto embedding = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{transposed, transposed}, -1);
+        auto cos = std::make_shared<ov::op::v0::Cos>(embedding);
+        auto sin = std::make_shared<ov::op::v0::Sin>(embedding);
+        cos->set_friendly_name("position_cos");
+        sin->set_friendly_name("position_sin");
+        auto cos_values = std::make_shared<ov::op::v0::Unsqueeze>(cos, axis);
+        auto sin_values = std::make_shared<ov::op::v0::Unsqueeze>(sin, axis);
+
+        auto split = std::make_shared<ov::op::v1::VariadicSplit>(
+            rope_input,
+            ov::op::v0::Constant::create(ov::element::i64, {1}, {3}),
+            ov::op::v0::Constant::create(ov::element::i64, {2}, std::vector<int64_t>{head_size / 2, head_size / 2}));
+        auto neg = std::make_shared<ov::op::v1::Multiply>(
+            split->output(1),
+            ov::op::v0::Constant::create(ov::element::f16, ov::Shape{1, 1, 1, 1}, {-1.f}));
+        auto rotated = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{neg, split->output(0)}, -1);
+        auto out = std::make_shared<ov::op::v1::Add>(
+            std::make_shared<ov::op::v1::Multiply>(rope_input, cos_values),
+            std::make_shared<ov::op::v1::Multiply>(rotated, sin_values));
+
+        function = std::make_shared<ov::Model>(ov::OutputVector{out}, ov::ParameterVector{input, pos_ids}, "ActivationsScalingRMSRoPE");
+    }
+
+    void generate_inputs(const std::vector<ov::Shape>& target_input_static_shapes) override {
+        inputs.clear();
+        const auto& model_inputs = function->inputs();
+
+        // Values in [600, 800] make the unscaled MatMul output (~89600) exceed f16 max (65504) unless scaled down.
+        ov::Tensor t_input(model_inputs[0].get_element_type(), target_input_static_shapes[0]);
+        auto* in_ptr = t_input.data<ov::float16>();
+        for (size_t i = 0; i < t_input.get_size(); ++i) {
+            in_ptr[i] = ov::float16(600.f + static_cast<float>((i * 41) % 200));
+        }
+
+        // Large position ids (>= 937) require f32 Sin/Cos precision to avoid f16 rounding errors.
+        ov::Tensor t_pos(ov::element::i32, target_input_static_shapes[1]);
+        auto* pos_ptr = t_pos.data<int32_t>();
+        for (size_t i = 0; i < t_pos.get_size(); ++i) {
+            pos_ptr[i] = 937 + static_cast<int32_t>(i);
+        }
+
+        inputs.insert({model_inputs[0].get_node_shared_ptr(), t_input});
+        inputs.insert({model_inputs[1].get_node_shared_ptr(), t_pos});
+    }
+
+    void validate() override {
+        ov::test::SubgraphBaseTest::validate();
+        auto runtime_model = compiledModel.get_runtime_model();
+        ov::test::CheckNumberOfNodesWithType(runtime_model, {"RoPE"}, 1);
+        ov::test::CheckNumberOfNodesWithType(runtime_model, {"rms"}, 0);
+        size_t sin_cos_count = 0;
+        for (const auto& node : runtime_model->get_ops()) {
+            const auto& info = node->get_rt_info();
+            auto orig_it = info.find("originalLayersNames");
+            if (orig_it == info.end())
+                continue;
+            const auto& names = orig_it->second.as<std::string>();
+            if (names.find("position_cos") != std::string::npos || names.find("position_sin") != std::string::npos) {
+                EXPECT_EQ(node->get_output_element_type(0), ov::element::f32) << names;
+                ++sin_cos_count;
+            }
+        }
+        EXPECT_EQ(sin_cos_count, 2);
+    }
+};
+
+TEST_F(ActivationsScalingRMSRoPE, smoke_Inference) {
     core->set_property(targetDevice, ov::hint::activations_scale_factor(8.f));
     run();
 }
