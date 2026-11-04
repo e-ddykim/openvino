@@ -26,6 +26,7 @@
 using namespace cldnn;
 using namespace ::tests;
 
+
 TEST(fully_connected_gpu, dynamic_byxf) {
     auto& engine = get_test_engine();
     auto input = engine.allocate_memory({ov::PartialShape{2, 2, 2}, data_types::f32, format::byxf});
@@ -7223,3 +7224,120 @@ INSTANTIATE_TEST_SUITE_P(smoke,
                          fully_connected_onednn_int4_alignment::GetTestCaseName);
 }  // namespace
 #endif
+
+// Repro for PR #39268 regression: 3D expert weights with scale per expert
+// but zero points shared across experts.  Fresh compile on the base code
+// selects per-OC ZP (mask 4); the PR forces grouped ZP (mask 7).
+
+static cldnn::engine* get_immad_engine_for_repro() {
+    static std::shared_ptr<cldnn::engine> ptr = nullptr;
+    if (!ptr) {
+        cldnn::device_query query(cldnn::engine_types::ocl, cldnn::runtime_types::ocl,
+                               nullptr, nullptr, 0, -1, true);
+        auto devices = query.get_available_devices();
+        for (auto& kv : devices) {
+            auto eng = cldnn::engine::create(cldnn::engine_types::ocl,
+                                      cldnn::runtime_types::ocl, kv.second);
+            if (eng->get_device_info().supports_immad) {
+                eng->create_onednn_engine({});
+                ptr = eng;
+                break;
+            }
+        }
+    }
+    return ptr ? ptr.get() : nullptr;
+}
+
+// Repro for PR #39268 regression:
+// weights [E, N, K] with per-expert scale [E, N, 1] and ZP shared over experts.
+// Current master selects per-OC ZP and passes; PR head forces grouped ZP and fails.
+using shared_zp_repro_params = std::tuple<bool, bool, bool>;
+class fully_connected_shared_zp_repro : public testing::TestWithParam<shared_zp_repro_params> {};
+
+TEST_P(fully_connected_shared_zp_repro, per_expert_scale_shared_zp) {
+    auto* engine_ptr = get_immad_engine_for_repro();
+    if (!engine_ptr)
+        GTEST_SKIP() << "The repro requires an IMMAD-capable GPU device.";
+    auto& engine = *engine_ptr;
+
+    const auto [weights_transposed, transpose_scale, transpose_zp] = GetParam();
+    constexpr int64_t experts = 4;
+    constexpr int64_t tokens = 2;
+    constexpr int64_t ofm = 4;
+    constexpr int64_t ifm = 64;
+
+    // per-expert scale, shared zero point across experts; one IFM group.
+    const auto weights_shape = weights_transposed
+        ? ov::PartialShape{experts, ofm, ifm}
+        : ov::PartialShape{experts, ifm, ofm};
+    const auto scale_shape = transpose_scale
+        ? ov::PartialShape{experts, ofm, 1}
+        : ov::PartialShape{experts, 1, ofm};
+    // rank-3 parameter with leading broadcast batch dim, not rank-2.
+    const auto zp_shape = transpose_zp
+        ? ov::PartialShape{1, ofm, 1}
+        : ov::PartialShape{1, 1, ofm};
+
+    auto input = engine.allocate_memory({ov::PartialShape{experts, tokens, ifm}, data_types::f16, format::bfyx});
+    auto weights = engine.allocate_memory({weights_shape, data_types::u8, format::bfyx});
+    auto scale = engine.allocate_memory({scale_shape, data_types::f16, format::bfyx});
+    auto zp = engine.allocate_memory({zp_shape, data_types::u8, format::bfyx});
+
+    set_values<ov::float16>(input, std::vector<ov::float16>(experts * tokens * ifm, ov::float16(1.0f)));
+    set_values<uint8_t>(weights, std::vector<uint8_t>(experts * ofm * ifm, 9));
+
+    std::vector<ov::float16> scale_values(experts * ofm);
+    for (int64_t e = 0; e < experts; e++)
+        for (int64_t o = 0; o < ofm; o++)
+            scale_values[e * ofm + o] = ov::float16(e + 1);
+    set_values<ov::float16>(scale, scale_values);
+
+    std::vector<uint8_t> zp_values(ofm);
+    for (int64_t o = 0; o < ofm; o++)
+        zp_values[o] = static_cast<uint8_t>(o + 1);
+    set_values<uint8_t>(zp, zp_values);
+
+    auto topology = cldnn::topology(
+        input_layout("input", input->get_layout()),
+        data("weights", weights),
+        data("scale", scale),
+        data("zp", zp),
+        fully_connected("fc", input_info("input"), "weights", "", "scale", "zp",
+                        data_types::f16, 3, 3, weights_transposed, transpose_scale, transpose_zp));
+
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_user_property(ov::hint::dynamic_quantization_group_size(0));
+    const ov::intel_gpu::ImplementationDesc impl = {format::bfyx, "", impl_types::onednn};
+    config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"fc", impl}}));
+
+    auto stream = engine.create_stream(config);
+    auto network = get_network(engine, topology, config, stream, false);
+    ASSERT_TRUE(network->get_primitive("fc")->get_impl()->is_onednn());
+    network->set_input_data("input", input);
+    auto output = network->execute().at("fc").get_memory();
+    ASSERT_EQ(output->get_layout().get_partial_shape(), (ov::PartialShape{experts, tokens, ofm}));
+    mem_lock<ov::float16, mem_lock_type::read> result(output, *stream);
+    ASSERT_EQ(result.size(), static_cast<size_t>(experts * tokens * ofm));
+
+    for (int64_t e = 0; e < experts; e++) {
+        for (int64_t t = 0; t < tokens; t++) {
+            for (int64_t o = 0; o < ofm; o++) {
+                const auto idx = (e * tokens + t) * ofm + o;
+                const float expected = 64.0f * (9.0f - static_cast<float>(zp_values[o])) *
+                                        static_cast<float>(scale_values[e * ofm + o]);
+                EXPECT_FLOAT_EQ(static_cast<float>(result[idx]), expected)
+                    << "expert=" << e << ", token=" << t << ", oc=" << o
+                    << ", weights_transposed=" << weights_transposed
+                    << ", transpose_scale=" << transpose_scale
+                    << ", transpose_zp=" << transpose_zp;
+            }
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    pr39268_repro,
+    fully_connected_shared_zp_repro,
+    testing::Combine(testing::Bool(), testing::Bool(), testing::Bool()));
