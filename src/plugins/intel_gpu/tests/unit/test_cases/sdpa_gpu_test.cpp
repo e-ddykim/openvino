@@ -757,7 +757,8 @@ public:
         const auto& p = info.param;
         std::string fill = std::isinf(p.fill) ? "neg_inf" : std::to_string(static_cast<int>(std::log10(-p.fill) * 100));
         return std::string(p.dt == data_types::bf16 ? "bf16" : "f16") + "_fill_" + fill + (p.use_micro ? "_micro" : "_opt") +
-               (p.scalar_mask ? "_scalar_mask" : "_tensor_mask") + (p.scale != 0.0f ? "_custom_scale" : "");
+               (p.scalar_mask ? "_scalar_mask" : "_tensor_mask") +
+               (p.scale != 0.0f ? "_custom_scale_" + std::to_string(static_cast<int>(-std::log10(p.scale))) : "");
     }
 
 protected:
@@ -928,6 +929,9 @@ INSTANTIATE_TEST_SUITE_P(smoke_sdpa_mask_fill,
                              sdpa_mask_fill_params{data_types::bf16, torch_mask_fill, true, true, masked_row_check::mean_v},
                              // small custom scale: the saturated mask must still give the masked keys exactly zero weight
                              sdpa_mask_fill_params{data_types::bf16, -1e4f, true, false, masked_row_check::mean_v, 1e-30f},
+                              // Reproducer: saturation is too weak for a tiny custom scale, so
+                              // masked keys keep non-zero weight in partially masked rows.
+                              sdpa_mask_fill_params{data_types::bf16, -1e4f, true, false, masked_row_check::softmax, 1e-38f},
                              sdpa_mask_fill_params{data_types::bf16, torch_mask_fill, false, false, masked_row_check::hull},
                              sdpa_mask_fill_params{data_types::bf16, neg_inf, false, false, masked_row_check::hull},
                              sdpa_mask_fill_params{data_types::bf16, torch_mask_fill, false, true, masked_row_check::hull},
