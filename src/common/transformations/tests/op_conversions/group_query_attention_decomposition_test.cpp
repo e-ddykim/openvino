@@ -1488,3 +1488,79 @@ TEST(GroupQueryAttentionValues, padded_query_batched_oversized_buffer_still_trim
               (PartialShape{2, KV_NUM_HEADS, total_sequence_length, HEAD_SIZE}))
         << "an oversized Concat-grown buffer (12 rows) must still be trimmed to capacity (8), not returned as-is";
 }
+
+// Reproducer: explicit position_ids are gathered directly, without the Minimum
+// cap used by the implicit rotary-position path. A padded row with a position
+// outside the cos/sin cache range is therefore gathered out of bounds.
+TEST(GroupQueryAttentionValues, explicit_position_ids_padded_rows_not_capped) {
+    const auto f32 = element::f32;
+    constexpr int64_t S = 4;
+    constexpr int64_t PAST_ROWS = 8;
+
+    auto q = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, NUM_HEADS, S, HEAD_SIZE});
+    auto k = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, S, HEAD_SIZE});
+    auto v = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, S, HEAD_SIZE});
+    auto past_key = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, PAST_ROWS, HEAD_SIZE});
+    auto past_value = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, PAST_ROWS, HEAD_SIZE});
+    auto seqlens_k = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{1});
+    auto total_seq = op::v0::Constant::create(element::i32, Shape{}, {8});
+    auto cos = op::v0::Constant::create(element::f32, Shape{16, HEAD_SIZE / 2}, std::vector<float>(16 * (HEAD_SIZE / 2), 1.0f));
+    auto sin = op::v0::Constant::create(element::f32, Shape{16, HEAD_SIZE / 2}, std::vector<float>(16 * (HEAD_SIZE / 2), 0.0f));
+    auto position_ids = std::make_shared<op::v0::Parameter>(element::i64, PartialShape{1, S});
+    auto query_seqlens = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{1});
+
+    const auto empty = op::v0::Constant::create(element::dynamic, Shape{0}, {});
+    OutputVector args(17, empty);
+    args[0] = q->output(0);
+    args[1] = k->output(0);
+    args[2] = v->output(0);
+    args[3] = past_key->output(0);
+    args[4] = past_value->output(0);
+    args[5] = seqlens_k->output(0);
+    args[6] = total_seq->output(0);
+    args[7] = cos->output(0);
+    args[8] = sin->output(0);
+    args[9] = position_ids->output(0);
+    args[16] = query_seqlens->output(0);
+
+    auto gqa = std::make_shared<GroupQueryAttention>(args,
+                                             NUM_HEADS,
+                                             KV_NUM_HEADS,
+                                             /*scale*/ 0.0f,
+                                             /*do_rotary*/ true,
+                                             /*rotary_interleaved*/ false,
+                                             /*kv_cache_bit_width*/ 0,
+                                             op::internal::GroupQueryAttentionQuantType::NONE,
+                                             op::internal::GroupQueryAttentionQuantType::NONE,
+                                             /*local_window_size*/ -1,
+                                             /*sliding_window_cache*/ false,
+                                             /*smooth_softmax*/ false,
+                                             /*causal*/ true,
+                                             /*softcap*/ 0.0f);
+    ASSERT_TRUE(gqa->has_query_seqlens());
+    ASSERT_FALSE(gqa->has_qk_norm());
+
+    ResultVector results;
+    for (size_t i = 0; i < gqa->get_output_size(); ++i)
+        results.push_back(std::make_shared<op::v0::Result>(gqa->output(i)));
+    ParameterVector params{q, k, v, past_key, past_value, seqlens_k, position_ids, query_seqlens};
+    auto model = std::make_shared<Model>(results, params);
+    decompose(model);
+
+    bool found_cos_or_sin_gather = false;
+    bool capped = false;
+    for (const auto& op : model->get_ordered_ops()) {
+        const auto gather = as_type_ptr<op::v8::Gather>(op);
+        if (!gather)
+            continue;
+        const auto source = gather->input_value(0).get_node_shared_ptr();
+        if (source == cos || source == sin) {
+            found_cos_or_sin_gather = true;
+            const auto idx = gather->input_value(1).get_node_shared_ptr();
+            if (as_type_ptr<op::v1::Minimum>(idx))
+                capped = true;
+        }
+    }
+    EXPECT_TRUE(found_cos_or_sin_gather) << "rotary Gather nodes were not emitted";
+    EXPECT_TRUE(capped) << "explicit position_ids Gather indices must be Minimum-capped to seqlens_k";
+}
