@@ -53,7 +53,8 @@ using ov::pass::operator|;
         auto mul_value_param_reshape_convert_m =\
              wrap_type<ov::op::v0::Convert>({mul_value_param_reshape_m});\
         auto mul_const_m = mul_value_const_m | mul_value_param_m | mul_value_param_reshape_m |\
-                           mul_value_param_convert_reshape_m | mul_value_param_reshape_convert_m;\
+                           mul_value_param_convert_m | mul_value_param_convert_reshape_m |\
+                           mul_value_param_reshape_convert_m;\
         auto mul_with_sub_m = wrap_type<ov::op::v1::Multiply>({subtract_m, mul_const_m});\
         auto mul_const_convert_m = ov::pass::pattern::optional<ov::op::v0::Convert>(mul_const_m);\
         auto mul_no_sub_m = wrap_type<ov::op::v1::Multiply>({decompressed_weights_m, mul_const_convert_m});\

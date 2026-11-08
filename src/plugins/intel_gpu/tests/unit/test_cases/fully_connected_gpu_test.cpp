@@ -20,6 +20,11 @@
 
 #include "intel_gpu/runtime/compilation_context.hpp"
 #include "fully_connected_inst.h"
+#include "intel_gpu/plugin/remote_context.hpp"
+#include "intel_gpu/plugin/transformations_pipeline.hpp"
+
+#include "openvino/op/ops.hpp"
+#include "openvino/runtime/core.hpp"
 
 #include <cmath>
 
@@ -3371,6 +3376,57 @@ void test_compressed_int4_scale_dynamic_batch_gemv(bool is_caching_test,
         }
     }
 
+    // Per-tensor (1-element) runtime scale/zero point with single-token decode: the buffers stay in the graph as
+    // inputs and must be broadcast to every output channel instead of being indexed per channel (OOB read class).
+    // ifm > 128 additionally makes the kernel define SINGLE_GROUP_NUM (one scale group spanning K), whose branch
+    // indexes scales/zps by channel block as well and needs the same broadcast guard. weights_fmt selects the
+    // kernel's OS layout variant (the SINGLE_GROUP_NUM loads differ between OSV16 and OSV32_ISV2).
+    void test_compressed_int4_per_tensor_parameter_scale_zp(int64_t ifm_value = 64, format::type weights_fmt = format::bfyx) {
+        auto& engine = get_test_engine();
+
+        constexpr int64_t ofm = 32;
+        const int64_t ifm = ifm_value;
+
+        auto input_mem = engine.allocate_memory({ {1, 1, ifm}, data_types::f16, format::bfyx });
+        auto weights_mem = engine.allocate_memory({ {ofm, ifm}, data_types::u4, weights_fmt });
+        auto scale_mem = engine.allocate_memory({ {1, 1}, data_types::f16, format::bfyx });
+        auto zp_mem = engine.allocate_memory({ {1, 1}, data_types::u8, format::bfyx });
+
+        std::vector<ov::float16> input_data(ifm, ov::float16{1.0f});
+        set_values(input_mem, input_data);
+        // u4 weights packed two per byte, all nibbles = 5.
+        set_values(weights_mem, std::vector<uint8_t>(ofm * ifm / 2, 0x55));
+        set_values(scale_mem, std::vector<ov::float16>{1.0f});
+        set_values(zp_mem, std::vector<uint8_t>{4});
+
+        topology topology(
+            input_layout("input", input_mem->get_layout()),
+            data("weights", weights_mem),
+            input_layout("scale", scale_mem->get_layout()),
+            input_layout("zp", zp_mem->get_layout()),
+            fully_connected("fc_prim", input_info("input"), "weights", "", "scale", "zp", data_types::f16, 3, 2,
+                            true, false, false));
+
+        auto config = get_test_default_config(engine);
+        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+        config.set_property(ov::intel_gpu::optimize_data(true));
+
+        network network(engine, topology, config);
+        network.set_input_data("input", input_mem);
+        network.set_input_data("scale", scale_mem);
+        network.set_input_data("zp", zp_mem);
+
+        auto outputs = network.execute();
+        auto output_mem = outputs.at("fc_prim").get_memory();
+        cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output_mem, get_test_stream());
+        ASSERT_EQ((ov::PartialShape{1, 1, ofm}), output_mem->get_layout().get_partial_shape());
+
+        const float expected = static_cast<float>(ifm) * (5.0f - 4.0f) * 1.0f;
+        for (int64_t output = 0; output < ofm; ++output) {
+            EXPECT_NEAR(expected, static_cast<float>(output_ptr[output]), 1e-1f) << "output = " << output;
+        }
+    }
+
     void test_dynamic(bool is_caching_test) {
         auto& engine = get_test_engine();
 
@@ -6225,6 +6281,137 @@ TEST_F(fully_connected_gpu_tests, compressed_int8_parameter_scale_zp_per_group) 
 
 TEST_F(fully_connected_gpu_tests, compressed_int8_parameter_scale_zp_per_group_transposed) {
     this->test_compressed_int8_parameter_scale_zp(true, true);
+}
+
+TEST_F(fully_connected_gpu_tests, compressed_int4_per_tensor_parameter_scale_zp) {
+    this->test_compressed_int4_per_tensor_parameter_scale_zp();
+}
+
+// K = 256 (> 128) makes the gemv kernel define SINGLE_GROUP_NUM, whose per-channel-block scale/zp loads
+// need the same 1-element broadcast guard as the multi-group branch.
+TEST_F(fully_connected_gpu_tests, compressed_int4_per_tensor_parameter_scale_zp_k256) {
+    this->test_compressed_int4_per_tensor_parameter_scale_zp(256);
+}
+
+// Same SINGLE_GROUP_NUM configuration, but on the OSV32_ISV2 kernel variant, which loads scales/zps at
+// fixed channel offsets (16) under SINGLE_GROUP_NUM instead of only at index 0.
+TEST_F(fully_connected_gpu_tests, compressed_int4_per_tensor_parameter_scale_zp_k256_osv32) {
+    this->test_compressed_int4_per_tensor_parameter_scale_zp(256, format::os_is_yx_osv32_isv2);
+}
+
+// ov::Core resolves plain "GPU" to the first enumerated device and ignores --device_suffix, so pin the
+// execution device to the one behind get_test_engine() (the plugin reports the very cldnn device_info uuid).
+static std::string get_engine_gpu_device_name() {
+    auto& engine = get_test_engine();
+    const auto engine_uuid = engine.get_device_info().uuid;
+    ov::Core core;
+    for (const auto& device : core.get_available_devices()) {
+        if (device.rfind("GPU", 0) != 0) {
+            continue;
+        }
+        try {
+            if (core.get_property(device, ov::device::uuid).uuid == engine_uuid.uuid) {
+                return device;
+            }
+        } catch (const ov::Exception&) {
+        }
+    }
+    return "GPU";
+}
+
+// Full-pipeline regression for runtime scale/zp: an f32 scale Parameter and a u8 zp Parameter feeding a
+// compressed MatMul reach GPU:PostLPT through ConvertPrecision, so the scale arrives as a bare
+// Convert(Parameter) and the zp as Convert(Parameter) over the Subtract operand. The pipeline must
+// create FullyConnectedCompressed with an f16 scale (Convert preserved) and a u8 integer zero point,
+// and the device must compute the dequantized values.
+TEST_F(fully_connected_gpu_tests, compressed_int8_parameter_scale_zp_full_pipeline) {
+    auto& engine = get_test_engine();
+    auto context = std::make_shared<ov::intel_gpu::RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});
+
+    // weights u8 [N=4, K=16] = 5, data all ones -> out[n] = 16 * (5 - zp[n]) * scale[n]
+    auto make_model = [](ov::PartialShape data_ps) {
+        auto data = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, data_ps);
+        auto weights = ov::op::v0::Constant::create(ov::element::u8, ov::Shape{4, 16}, {5});
+        auto weights_convert = std::make_shared<ov::op::v0::Convert>(weights, ov::element::f32);
+        auto scale = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{4, 1});
+        auto zp = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::PartialShape{4, 1});
+        auto zp_convert = std::make_shared<ov::op::v0::Convert>(zp, ov::element::f32);
+        auto sub = std::make_shared<ov::op::v1::Subtract>(weights_convert, zp_convert);
+        auto mul = std::make_shared<ov::op::v1::Multiply>(sub, scale);
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(data, mul, false, true);
+        return std::make_shared<ov::Model>(ov::OutputVector{matmul}, ov::ParameterVector{data, scale, zp});
+    };
+
+    auto model = make_model({2, 16});
+    auto config = get_test_default_config(engine);
+    config.finalize(context.get(), model.get());
+    ov::intel_gpu::TransformationsPipeline pipeline(config, context);
+    pipeline.apply(model);
+
+    std::shared_ptr<ov::Node> fc_compressed;
+    for (const auto& op : model->get_ordered_ops()) {
+        if (op->get_type_name() == std::string("FullyConnectedCompressed")) {
+            fc_compressed = op;
+        }
+    }
+    ASSERT_TRUE(fc_compressed != nullptr) << "runtime scale/zp graph was not compressed";
+    EXPECT_EQ(fc_compressed->get_input_element_type(3), ov::element::f16)
+        << "scale input must keep the graph precision (its Convert must not be stripped)";
+    EXPECT_EQ(fc_compressed->get_input_element_type(4), ov::element::u8)
+        << "zero point input must stay an integer value";
+
+    // Execute through the real plugin entry point, on the device selected by --device_suffix.
+    ov::Core core;
+    const auto device_name = get_engine_gpu_device_name();
+    auto compiled = core.compile_model(make_model({2, 16}), device_name, ov::hint::inference_precision(ov::element::f16));
+    const auto execution_devices = compiled.get_property(ov::execution_devices);
+    ASSERT_FALSE(execution_devices.empty());
+    EXPECT_EQ(execution_devices.front(), device_name) << "test must run on the get_test_engine() device";
+    auto request = compiled.create_infer_request();
+    std::vector<float> data_data(2 * 16, 1.0f);
+    std::vector<float> scale_data = {2.f, 1.f, 1.f, 2.f};
+    std::vector<uint8_t> zp_data = {4, 4, 5, 4};
+    request.set_input_tensor(0, ov::Tensor(ov::element::f32, {2, 16}, data_data.data()));
+    request.set_input_tensor(1, ov::Tensor(ov::element::f32, {4, 1}, scale_data.data()));
+    request.set_input_tensor(2, ov::Tensor(ov::element::u8, {4, 1}, zp_data.data()));
+    request.infer();
+    const float* output = request.get_output_tensor().data<const float>();
+    const float expected[4] = {32.f, 16.f, 0.f, 32.f};  // 16 * (5 - zp) * scale
+    for (int b = 0; b < 2; ++b) {
+        for (int n = 0; n < 4; ++n) {
+            EXPECT_NEAR(expected[n], output[b * 4 + n], 1e-1f) << "batch = " << b << ", output = " << n;
+        }
+    }
+}
+
+// Per-tensor (1-element) runtime scale/zp through the full pipeline with single-token batch.
+TEST_F(fully_connected_gpu_tests, compressed_int8_per_tensor_parameter_scale_zp_full_pipeline) {
+    auto data = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 16});
+    auto weights = ov::op::v0::Constant::create(ov::element::u8, ov::Shape{4, 16}, {5});
+    auto weights_convert = std::make_shared<ov::op::v0::Convert>(weights, ov::element::f32);
+    auto scale = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 1});
+    auto zp = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::PartialShape{1, 1});
+    auto zp_convert = std::make_shared<ov::op::v0::Convert>(zp, ov::element::f32);
+    auto sub = std::make_shared<ov::op::v1::Subtract>(weights_convert, zp_convert);
+    auto mul = std::make_shared<ov::op::v1::Multiply>(sub, scale);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(data, mul, false, true);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{matmul}, ov::ParameterVector{data, scale, zp});
+
+    ov::Core core;
+    auto compiled = core.compile_model(model, get_engine_gpu_device_name(), ov::hint::inference_precision(ov::element::f16));
+    auto request = compiled.create_infer_request();
+    std::vector<float> data_data(16, 1.0f);
+    std::vector<float> scale_data = {2.f};
+    std::vector<uint8_t> zp_data = {3};
+    request.set_input_tensor(0, ov::Tensor(ov::element::f32, {1, 16}, data_data.data()));
+    request.set_input_tensor(1, ov::Tensor(ov::element::f32, {1, 1}, scale_data.data()));
+    request.set_input_tensor(2, ov::Tensor(ov::element::u8, {1, 1}, zp_data.data()));
+    request.infer();
+    const float* output = request.get_output_tensor().data<const float>();
+    const float expected = 16.f * (5.f - 3.f) * 2.f;  // 64 for every output channel
+    for (int n = 0; n < 4; ++n) {
+        EXPECT_NEAR(expected, output[n], 1e-1f) << "output = " << n;
+    }
 }
 
 TEST_F(fully_connected_gpu_tests, compressed_int8_scale_b1) {

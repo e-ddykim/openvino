@@ -170,7 +170,7 @@ inline void (FUNC_NAME)(
                                 ACCUMULATOR_TYPE ds = decompression_scale[scale_offset];
                             #else
                             #if OUTER_OFM > 1
-                                ACCUMULATOR_TYPE ds = decompression_scale[offset_ofm];
+                                ACCUMULATOR_TYPE ds = decompression_scale[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : offset_ofm];
                             #else
                                 ACCUMULATOR_TYPE ds = d_scales[fi % DECOMPRESSION_SCALE_LENGTH];
                             #endif
@@ -188,7 +188,7 @@ inline void (FUNC_NAME)(
                                 ACCUMULATOR_TYPE dzp = decompression_zp[zp_offset];
                             #else
                             #if OUTER_OFM > 1
-                                ACCUMULATOR_TYPE dzp = decompression_zp[offset_ofm];
+                                ACCUMULATOR_TYPE dzp = decompression_zp[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : offset_ofm];
                             #else
                                 ACCUMULATOR_TYPE dzp = d_zps[fi % DECOMPRESSION_ZP_LENGTH];
                             #endif
@@ -222,7 +222,7 @@ inline void (FUNC_NAME)(
                         ACCUMULATOR_TYPE ds = decompression_scale[scale_offset];
                     #else
                     #if OUTER_OFM > 1
-                        ACCUMULATOR_TYPE ds = decompression_scale[offset_ofm];
+                        ACCUMULATOR_TYPE ds = decompression_scale[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : offset_ofm];
                     #else
                         ACCUMULATOR_TYPE ds = d_scales[fi % DECOMPRESSION_SCALE_LENGTH];
                     #endif
@@ -249,7 +249,7 @@ inline void (FUNC_NAME)(
                     ACCUMULATOR_TYPE ds = decompression_scale[scale_offset];
                 #else
                 #if OUTER_OFM > 1
-                    ACCUMULATOR_TYPE ds = decompression_scale[offset_ofm];
+                    ACCUMULATOR_TYPE ds = decompression_scale[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : offset_ofm];
                 #else
                     ACCUMULATOR_TYPE ds = d_scales[fi % DECOMPRESSION_SCALE_LENGTH];
                 #endif
@@ -308,7 +308,7 @@ inline void (FUNC_NAME)(
                             ACCUMULATOR_TYPE ds = decompression_scale[scale_offset];
                         #else
                         #if OUTER_OFM > 1
-                            ACCUMULATOR_TYPE ds = decompression_scale[offset_ofm];
+                            ACCUMULATOR_TYPE ds = decompression_scale[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : offset_ofm];
                         #else
                             ACCUMULATOR_TYPE ds = d_scales[fi % DECOMPRESSION_SCALE_LENGTH];
                         #endif
@@ -323,7 +323,7 @@ inline void (FUNC_NAME)(
                                 ACCUMULATOR_TYPE dzp = decompression_zp[zp_offset];
                             #else
                             #if OUTER_OFM > 1
-                                ACCUMULATOR_TYPE dzp = decompression_zp[offset_ofm];
+                                ACCUMULATOR_TYPE dzp = decompression_zp[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : offset_ofm];
                             #else
                                 ACCUMULATOR_TYPE dzp = d_zps[fi % DECOMPRESSION_ZP_LENGTH];
                             #endif

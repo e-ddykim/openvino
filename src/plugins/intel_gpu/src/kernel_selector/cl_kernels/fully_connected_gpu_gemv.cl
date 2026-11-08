@@ -132,10 +132,14 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(fully_connected
     __local float all_sum_even[16][16];  // [wi_id, thr_id]
     __local float all_sum_odd[16][16];
 
-    // Scale layout is byfx
+    // Scale layout is byfx. A single-element (per-tensor) scale/zp buffer must not be offset per output channel.
+#    if !defined(DECOMPRESSION_SCALE_LENGTH) || DECOMPRESSION_SCALE_LENGTH != 1
     scales += n;
+#    endif
 #    if DECOMPRESSION_ZP_TERM && !DECOMPRESSION_ZP_SCALAR
+#        if !defined(DECOMPRESSION_ZP_LENGTH) || DECOMPRESSION_ZP_LENGTH != 1
     zps += n;
+#        endif
 #    endif
 
     float sum_all = 0;
@@ -148,14 +152,14 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(fully_connected
 #    ifdef SINGLE_GROUP_NUM
         float scale_1 = convert_float(scales[0]);
 #    else
-        float scale_1 = convert_float(scales[gk * WEIGHTS_N]);
+        float scale_1 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : gk * WEIGHTS_N]);
 #    endif
 
 #    if DECOMPRESSION_ZP_TERM && !DECOMPRESSION_ZP_SCALAR
 #        ifdef SINGLE_GROUP_NUM
         GEMV_FILTER_VEC_TYPE zpx16 = (GEMV_FILTER_VEC_TYPE)(zps[0]);
 #        else
-        GEMV_FILTER_VEC_TYPE zpx16 = (GEMV_FILTER_VEC_TYPE)(zps[gk * WEIGHTS_N]);
+        GEMV_FILTER_VEC_TYPE zpx16 = (GEMV_FILTER_VEC_TYPE)(zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : gk * WEIGHTS_N]);
 #        endif
 #    elif DECOMPRESSION_ZP_SCALAR
         GEMV_FILTER_VEC_TYPE zpx16 = (GEMV_FILTER_VEC_TYPE)(zp_scalar_value);
@@ -261,10 +265,14 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(fully_connected
     __local float all_sum_even[16][16];  // [wi_id, thr_id]
     __local float all_sum_odd[16][16];
 
-    // Scale layout is fbyx
+    // Scale layout is fbyx. A single-element (per-tensor) scale/zp buffer must not be offset per output channel.
+#    if !defined(DECOMPRESSION_SCALE_LENGTH) || DECOMPRESSION_SCALE_LENGTH != 1
     scales += (n / 32) * 32 + (n % 32) / 2;
+#    endif
 #    if DECOMPRESSION_ZP_TERM && !DECOMPRESSION_ZP_SCALAR
+#        if !defined(DECOMPRESSION_ZP_LENGTH) || DECOMPRESSION_ZP_LENGTH != 1
     zps += (n / 32) * 32 + (n % 32) / 2;
+#        endif
 #    endif
 
     float2 sum_all = 0;
@@ -276,19 +284,19 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(fully_connected
         GEMV_ACCUMULATOR_VEC_TYPE sum = 0;
 #    ifdef SINGLE_GROUP_NUM
         float scale_0 = convert_float(scales[0]);
-        float scale_1 = convert_float(scales[16]);
+        float scale_1 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : 16]);
 #    else
-        float scale_0 = convert_float(scales[gk * WEIGHTS_N]);
-        float scale_1 = convert_float(scales[gk * WEIGHTS_N + 16]);
+        float scale_0 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : gk * WEIGHTS_N]);
+        float scale_1 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 16]);
 #    endif
 
 #    if DECOMPRESSION_ZP_TERM && !DECOMPRESSION_ZP_SCALAR
 #        ifdef SINGLE_GROUP_NUM
         half zp0 = zps[0];
-        half zp1 = zps[16];
+        half zp1 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : 16];
 #        else
-        half zp0 = zps[gk * WEIGHTS_N];
-        half zp1 = zps[gk * WEIGHTS_N + 16];
+        half zp0 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : gk * WEIGHTS_N];
+        half zp1 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 16];
 #        endif
         GEMV_FILTER_VEC_TYPE zpx16 = {zp0, zp1, zp0, zp1, zp0, zp1, zp0, zp1, zp0, zp1, zp0, zp1, zp0, zp1, zp0, zp1};
 #    elif DECOMPRESSION_ZP_SCALAR
@@ -410,9 +418,14 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(fully_connected
     __local float all_sum_2[16][16];  // [wi_id, thr_id]
     __local float all_sum_3[16][16];  // [wi_id, thr_id]
 
+    // A single-element (per-tensor) scale/zp buffer must not be offset per output channel.
+#    if !defined(DECOMPRESSION_SCALE_LENGTH) || DECOMPRESSION_SCALE_LENGTH != 1
     scales += (n / 64) * 64 + (n % 64) / 4;
+#    endif
 #    if DECOMPRESSION_ZP_TERM && !DECOMPRESSION_ZP_SCALAR
+#        if !defined(DECOMPRESSION_ZP_LENGTH) || DECOMPRESSION_ZP_LENGTH != 1
     zps += (n / 64) * 64 + (n % 64) / 4;
+#        endif
 #    endif
 
     float4 sum_all = 0;
@@ -424,26 +437,26 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(fully_connected
         GEMV_ACCUMULATOR_VEC_TYPE sum = 0;
 #    ifdef SINGLE_GROUP_NUM
         float scale_0 = convert_float(scales[0]);
-        float scale_1 = convert_float(scales[16]);
-        float scale_2 = convert_float(scales[2 * 16]);
-        float scale_3 = convert_float(scales[3 * 16]);
+        float scale_1 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : 1 * 16]);
+        float scale_2 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : 2 * 16]);
+        float scale_3 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : 3 * 16]);
 #    else
-        float scale_0 = convert_float(scales[gk * WEIGHTS_N]);
-        float scale_1 = convert_float(scales[gk * WEIGHTS_N + 1 * 16]);
-        float scale_2 = convert_float(scales[gk * WEIGHTS_N + 2 * 16]);
-        float scale_3 = convert_float(scales[gk * WEIGHTS_N + 3 * 16]);
+        float scale_0 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : gk * WEIGHTS_N]);
+        float scale_1 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 1 * 16]);
+        float scale_2 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 2 * 16]);
+        float scale_3 = convert_float(scales[DECOMPRESSION_SCALE_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 3 * 16]);
 #    endif
 #    if DECOMPRESSION_ZP_TERM && !DECOMPRESSION_ZP_SCALAR
 #        ifdef SINGLE_GROUP_NUM
         half zp0 = zps[0];
-        half zp1 = zps[1 * 16];
-        half zp2 = zps[2 * 16];
-        half zp3 = zps[3 * 16];
+        half zp1 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : 1 * 16];
+        half zp2 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : 2 * 16];
+        half zp3 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : 3 * 16];
 #        else
-        half zp0 = zps[gk * WEIGHTS_N];
-        half zp1 = zps[gk * WEIGHTS_N + 1 * 16];
-        half zp2 = zps[gk * WEIGHTS_N + 2 * 16];
-        half zp3 = zps[gk * WEIGHTS_N + 3 * 16];
+        half zp0 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : gk * WEIGHTS_N];
+        half zp1 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 1 * 16];
+        half zp2 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 2 * 16];
+        half zp3 = zps[DECOMPRESSION_ZP_LENGTH == 1 ? 0 : gk * WEIGHTS_N + 3 * 16];
 #        endif
         GEMV_FILTER_VEC_TYPE zpx16 = {zp0, zp1, zp2, zp3, zp0, zp1, zp2, zp3, zp0, zp1, zp2, zp3, zp0, zp1, zp2, zp3};
 #    elif DECOMPRESSION_ZP_SCALAR
