@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include "test_utils.h"
 #include "random_generator.hpp"
 
@@ -34,6 +35,8 @@ struct moe_gemm_test_params {
     bool weight_symmetric_quant;
     bool is_pa;
     bool is_caching_test;
+    // Models a runtime arrangement that disagrees with has_batch_dim (CVS-198888).
+    std::optional<bool> has_batch_dim_override;
 };
 
 template <typename T>
@@ -275,7 +278,7 @@ struct MoEGemmTest : public ::testing::TestWithParam<T> {
         ov::op::internal::MOECompressed::Config moe_config;
         moe_config.top_k = p.num_experts_per_token;
         moe_config.num_expert = p.num_total_experts;
-        moe_config.has_batch_dim = !p.is_pa;
+        moe_config.has_batch_dim = p.has_batch_dim_override.value_or(!p.is_pa);
         moe_config.hidden_size = p.hidden_size;
         moe_config.inter_size = p.out_N;
         auto num_scale_groups = p.hidden_size / p.scale_group_size;
@@ -480,6 +483,16 @@ struct MoEGemmTest : public ::testing::TestWithParam<T> {
         network->set_input_data("input_tokens_lens", input_tokens_lens_mem);
         auto outputs = network->execute();
         auto output = outputs.at("moe_gemm").get_memory();
+        // Output arrangement must follow the input arrangement ([1,1,H] falls back to has_batch_dim).
+        {
+            const bool in_batch_arrangement = !p.is_pa;
+            const bool batch_out = (M == 1) ? p.has_batch_dim_override.value_or(!p.is_pa) : in_batch_arrangement;
+            const size_t out_rows = (M == 1) ? p.num_experts_per_token : M;
+            const auto expected_out_shape = batch_out
+                ? ov::PartialShape{ov::Dimension(1), ov::Dimension(static_cast<int64_t>(out_rows)), ov::Dimension(static_cast<int64_t>(p.out_N))}
+                : ov::PartialShape{ov::Dimension(static_cast<int64_t>(out_rows)), ov::Dimension(1), ov::Dimension(static_cast<int64_t>(p.out_N))};
+            ASSERT_EQ(output->get_layout().get_partial_shape(), expected_out_shape);
+        }
         cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output, get_test_stream());
 
         std::vector<ov::float16> output_ref(M * p.out_N, 0.0f);
@@ -715,3 +728,47 @@ INSTANTIATE_TEST_SUITE_P(smoke_moe_gemm,
                                                                                    false,                    /*is_pa*/
                                                                                    false                     /*is_caching_test*/
                                                                                }}));
+
+// Regression for CVS-198888: runtime arrangement disagrees with has_batch_dim; moe_gemm must
+// derive the token count and layout from the runtime shape.
+INSTANTIATE_TEST_SUITE_P(smoke_moe_gemm_token_axis_mismatch,
+                         moe_gemm_test,
+                         ::testing::Values(
+                             // PA arrangement [M, 1, H] but has_batch_dim=true
+                             moe_gemm_test_params{
+                                 PHASE::PREFILL,
+                                 static_cast<size_t>(30),   /*num_tokens*/
+                                 static_cast<size_t>(32),   /*num_total_experts*/
+                                 static_cast<size_t>(2),    /*num_experts_per_token*/
+                                 static_cast<size_t>(3),    /*num_actually_used_experts*/
+                                 static_cast<size_t>(128),  /*hidden_size*/
+                                 static_cast<size_t>(64),   /*out_N*/
+                                 false,                     /*has_bias*/
+                                 cldnn::data_types::f16,    /*input_dt*/
+                                 cldnn::data_types::f16,    /*weight_dt*/
+                                 cldnn::data_types::f16,    /*scale_dt*/
+                                 -1,                        /*scale_group_size*/
+                                 false,                     /*weight_symmetric_quant*/
+                                 true,                      /*is_pa: input [M, 1, H]*/
+                                 false,                     /*is_caching_test*/
+                                 true                       /*has_batch_dim_override = true*/
+                             },
+                             // batch arrangement [1, M, H] but has_batch_dim=false
+                             moe_gemm_test_params{
+                                 PHASE::PREFILL,
+                                 static_cast<size_t>(30),   /*num_tokens*/
+                                 static_cast<size_t>(32),   /*num_total_experts*/
+                                 static_cast<size_t>(2),    /*num_experts_per_token*/
+                                 static_cast<size_t>(3),    /*num_actually_used_experts*/
+                                 static_cast<size_t>(128),  /*hidden_size*/
+                                 static_cast<size_t>(64),   /*out_N*/
+                                 false,                     /*has_bias*/
+                                 cldnn::data_types::f16,    /*input_dt*/
+                                 cldnn::data_types::f16,    /*weight_dt*/
+                                 cldnn::data_types::f16,    /*scale_dt*/
+                                 -1,                        /*scale_group_size*/
+                                 false,                     /*weight_symmetric_quant*/
+                                 false,                     /*is_pa: input [1, M, H]*/
+                                 false,                     /*is_caching_test*/
+                                 false                      /*has_batch_dim_override = false*/
+                             }));
