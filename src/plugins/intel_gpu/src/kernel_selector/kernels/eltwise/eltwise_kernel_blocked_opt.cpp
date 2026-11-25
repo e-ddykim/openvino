@@ -319,9 +319,12 @@ JitConstants EltwiseKernel_blocked_opt::MakeLoadJitConstants(const eltwise_param
 
                     // Select indexing method based on broadcasting type and tensor size
                     if (in_tensor.LogicalSize() == 1) {
-                        // Sample : half8 tmp_a0_1 = (half8)(input1[0]);
+                        // Sample : half8 tmp_a0_1 = (half8)(input1[get_b_fs_yx_fsv_index(0, 0, 0, 0, ...)]);
+                        // The singleton index macro resolves to the first logical element, which is not
+                        // offset 0 when the tensor has padding (or is blocked and spatially padded).
                         const std::string vload_value = "\\\n\t " + temp_vec_type + " " + temp_vec_var + " = " + "(" + temp_vec_type + ")DECODE_INPUT" +
-                                                        in_idx_str + "_COMPUTE_TYPE(" + input_i + "[0])";
+                                                        in_idx_str + "_COMPUTE_TYPE(" + input_i + "[GET_INDEX(INPUT, " + in_idx_str + ", " +
+                                                        idx_order + ")])";
 
                         jit.AddConstant(MakeJitConstant(vload_name, vload_value));
                         jit.AddConstant(MakeJitConstant(name, temp_vec_var));

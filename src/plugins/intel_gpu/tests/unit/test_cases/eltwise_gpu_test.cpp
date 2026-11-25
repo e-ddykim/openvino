@@ -6105,3 +6105,114 @@ INSTANTIATE_TEST_SUITE_P(eltwise_cpu_impl,
                              .simple_params(data_types::f16, format::bfyx, format::bfyx, impl_types::cpu)
                              .simple_params(data_types::bf16, format::bfyx, format::bfyx, impl_types::cpu)
                          ));
+
+// Reproducer (dynamic path) for the blocked-singleton padded scalar offset.
+// The scalar [1,1,1,1] fsv16 with lower-X pad 1 holds its only logical element at physical
+// lane 16 (2.5); pad lanes contain 100. Correct product with a 1.0 input is 2.5; reading the
+// pad lane gives 100. Ground-truth oracle is used for both kernels because generic_eltwise_ref
+// was equally affected before the shared jitter fix.
+TEST(eltwise_gpu, blocked_opt_dynamic_padded_blocked_scalar_reads_logical_element) {
+    skip_if_no_fp16();
+    auto& engine = get_test_engine();
+    const layout scalar{ov::PartialShape{1, 1, 1, 1}, data_types::f16, format::b_fs_yx_fsv16, padding({0, 0, 0, 1}, {0, 0, 0, 0})};
+    auto scale = engine.allocate_memory(scalar);
+    std::vector<ov::float16> values(scalar.get_linear_size(), ov::float16(100.0F));
+    values[16] = ov::float16(2.5F);
+    set_values(scale, values);
+
+    auto make_topo = [&scale]() {
+        const layout dyn{ov::PartialShape::dynamic(4), data_types::f16, format::b_fs_yx_fsv16};
+        return topology(input_layout("a", dyn), data("s", scale),
+                        eltwise("ew", {input_info("a"), input_info("s")}, eltwise_mode::prod));
+    };
+    auto cfg = get_test_default_config(engine);
+    cfg.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    auto rcfg = cfg;
+    rcfg.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{
+        {"ew", {format::b_fs_yx_fsv16, "generic_eltwise_ref", impl_types::ocl}},
+    }));
+    network ref(engine, make_topo(), rcfg);
+    network opt(engine, make_topo(), cfg);
+    const auto* impl = opt.get_primitive("ew")->get_impl();
+    ASSERT_NE(impl, nullptr);
+    ASSERT_TRUE(impl->is_dynamic());
+    ASSERT_EQ(impl->get_kernel_name(), "eltwise_blocked_opt");
+
+    const layout al{ov::PartialShape{2, 10, 3, 3}, data_types::f16, format::b_fs_yx_fsv16};
+    auto a = engine.allocate_memory(al);
+    set_values(a, std::vector<ov::float16>(al.get_linear_size(), ov::float16(1.0F)));
+    ref.set_input_data("a", a);
+    opt.set_input_data("a", a);
+    auto rm = ref.execute().at("ew").get_memory();
+    auto om = opt.execute().at("ew").get_memory();
+    cldnn::mem_lock<ov::float16, mem_lock_type::read> rp(rm, get_test_stream());
+    cldnn::mem_lock<ov::float16, mem_lock_type::read> op(om, get_test_stream());
+    ASSERT_FLOAT_EQ(static_cast<float>(op[0]), 2.5F);
+    ASSERT_FLOAT_EQ(static_cast<float>(rp[0]), 2.5F);
+}
+
+// Reproducer (static path) for the same offset defect in the literal input[0] scalar read.
+// Both operands are padded blocked scalars (Static Validate requires equal-LogicalSize inputs
+// to share paddings); a literal-lane-0 read yields 100+100=200, correct gives 4.0.
+TEST(eltwise_gpu, blocked_opt_static_padded_blocked_scalar_reads_logical_element) {
+    skip_if_no_fp16();
+    auto& engine = get_test_engine();
+    const layout p1_in{ov::PartialShape{1, 1, 1, 1}, data_types::f16, format::b_fs_yx_fsv16, padding({0, 0, 0, 1}, {0, 0, 0, 0})};
+    auto m1 = engine.allocate_memory(p1_in);
+    auto m2 = engine.allocate_memory(p1_in);
+    {
+        std::vector<ov::float16> v1(p1_in.get_linear_size(), ov::float16(100.0F));
+        v1[16] = ov::float16(1.5F);
+        set_values(m1, v1);
+        std::vector<ov::float16> v2(p1_in.get_linear_size(), ov::float16(100.0F));
+        v2[16] = ov::float16(2.5F);
+        set_values(m2, v2);
+    }
+    topology topo(input_layout("p1", p1_in), data("c2", m2),
+                  eltwise("ew", {input_info("p1"), input_info("c2")}, eltwise_mode::sum));
+    auto cfg = get_test_default_config(engine);
+    cfg.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{
+        {"ew", {format::b_fs_yx_fsv16, "eltwise_blocked_opt", impl_types::ocl}},
+    }));
+    network net(engine, topo, cfg);
+    const auto kernel = net.get_primitive("ew")->get_impl()->get_kernel_name();
+    ASSERT_EQ(kernel, "eltwise_blocked_opt");
+    {
+        std::vector<ov::float16> v1(p1_in.get_linear_size(), ov::float16(100.0F));
+        v1[16] = ov::float16(1.5F);
+        set_values(m1, v1);
+    }
+    net.set_input_data("p1", m1);
+    auto out = net.execute().at("ew").get_memory();
+    cldnn::mem_lock<ov::float16, mem_lock_type::read> p(out, get_test_stream());
+    const auto ol = net.get_primitive("ew")->get_output_layout();
+    const auto i0 = ol.get_linear_offset(tensor(batch(0), feature(0), spatial(0, 0, 0, 0)));
+    ASSERT_FLOAT_EQ(static_cast<float>(p[i0]), 4.0F);
+}
+
+// Ticket reproducer (DISABLED - crashes the process on discrete GPUs):
+// Building a second cldnn::network from the SAME topology object that contains a `data`
+// primitive segfaults during that second construction on dGPU (reproduced on Arc A770 at
+// merge-base a4169396a05 and at PR head b6c51fc8c7e; UHD 770 passes). Padding, fsv16 and
+// eltwise mode are all irrelevant - a bare [1,1,1,1] fsv16 constant suffices.
+// Run with: --gtest_also_run_disabled_tests --gtest_filter=*two_networks_from_same_topology*
+TEST(eltwise_gpu, DISABLED_two_networks_from_same_topology_with_data_crashes_on_dgpu) {
+    auto& engine = get_test_engine();
+    const layout scal{ov::PartialShape{1, 1, 1, 1}, data_types::f16, format::b_fs_yx_fsv16};
+    auto mem = engine.allocate_memory(scal);
+    set_values(mem, std::vector<ov::float16>(16, ov::float16(1.0F)));
+    const layout dyn{ov::PartialShape::dynamic(4), data_types::f16, format::b_fs_yx_fsv16};
+    topology topo(input_layout("a", dyn), data("s", mem),
+                  eltwise("ew", {input_info("a"), input_info("s")}, eltwise_mode::prod));
+    auto cfg = get_test_default_config(engine);
+    cfg.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    network n1(engine, topo, cfg);
+    std::cout << "[REPRO] first network built OK, building second from the same topology..." << std::endl;
+    network n2(engine, topo, cfg);
+    std::cout << "[REPRO] second network built OK (no crash on this device)" << std::endl;
+    auto a = engine.allocate_memory(layout{ov::PartialShape{2, 10, 3, 3}, data_types::f16, format::b_fs_yx_fsv16});
+    n1.set_input_data("a", a);
+    n1.execute();
+    n2.set_input_data("a", a);
+    n2.execute();
+}

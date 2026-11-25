@@ -359,6 +359,51 @@ public:
     JitDefinitions GetDefinitions() const override;
 };
 
+// Returns the raw index function call evaluated at zero coordinates, e.g.
+// "GET_DATA_B_FS_YX_FSV16_INDEX(INPUT0, 0, 0, 0, 0)" for "GET_DATA_B_FS_YX_FSV16_INDEX(INPUT0, b, f, y, x)".
+// func_name carries the accepted coordinate list (e.g. "INPUT0_GET_INDEX_RAW(b, f, y, x)"); any trailing
+// non-coordinate arguments of func_val (e.g. a sub-group size) are preserved.
+static std::string ZeroCoordsIndexCall(const std::string& func_val, const std::string& func_name) {
+    const auto name_open = func_name.find('(');
+    const auto name_close = func_name.rfind(')');
+    const auto val_open = func_val.find('(');
+    const auto val_close = func_val.rfind(')');
+    if (name_open == std::string::npos || name_close == std::string::npos || name_close < name_open ||
+        val_open == std::string::npos || val_close == std::string::npos || val_close < val_open) {
+        return func_val;
+    }
+    size_t num_coords = 1;
+    for (size_t i = name_open + 1; i < name_close; i++) {
+        if (func_name[i] == ',') {
+            num_coords++;
+        }
+    }
+    std::vector<std::string> args;
+    const std::string inner = func_val.substr(val_open + 1, val_close - val_open - 1);
+    size_t start = 0;
+    while (true) {
+        const auto comma = inner.find(',', start);
+        if (comma == std::string::npos) {
+            args.push_back(inner.substr(start));
+            break;
+        }
+        args.push_back(inner.substr(start, comma - start));
+        start = comma + 1;
+    }
+    // args[0] is the tensor prefix; coordinates occupy args[1..num_coords].
+    if (args.size() < num_coords + 1) {
+        return func_val;
+    }
+    std::string result = func_val.substr(0, val_open + 1) + args[0];
+    for (size_t i = 1; i <= num_coords; i++) {
+        result += ", 0";
+    }
+    for (size_t i = num_coords + 1; i < args.size(); i++) {
+        result += "," + args[i];
+    }
+    return result + ")";
+}
+
 JitDefinitions DataTensorJitConstant::GetDefinitions() const {
     JitDefinitions baseDefinitions = TensorBaseTJitConstant::GetDefinitions(_tensor);
 
@@ -694,9 +739,18 @@ JitDefinitions DataTensorJitConstant::GetDefinitions() const {
 
     std::string offset = toCodeString(_tensor.GetFirstElementOffset());
     if (_tensor.LogicalSize() == 1 && !_tensor.is_dynamic()) {
-        // if tensor contains single element we can always return first element offset for safe function
-        definitions.push_back({ safe_index_func_name, offset });
-        definitions.push_back({ index_func_name, offset });
+        // if tensor contains single element we can always return first element offset for safe function.
+        // For simple (non-blocked) layouts GetFirstElementOffset() (logical pitches * pad.before) is the
+        // physical address already, and the raw function form (GET_DATA_INDEX_RAW) can't be used there:
+        // its *_PITCHES braced initializer list breaks nested macro argument expansion.
+        // For blocked layouts the logical pitches don't describe physical addressing (e.g. in
+        // b_fs_yx_fsv16 one X step is `alignment` elements), so evaluate the raw index function at zero
+        // coordinates instead - those bodies expand to plain arithmetic over scalar macros.
+        const std::string first_element_offset = (!_tensor.SimpleLayout() && !raw_index_func_val.empty())
+                                                     ? ZeroCoordsIndexCall(raw_index_func_val, raw_index_func_name)
+                                                     : offset;
+        definitions.push_back({ safe_index_func_name, first_element_offset });
+        definitions.push_back({ index_func_name, first_element_offset });
     } else if (_tensor.LogicalSize() == _tensor.Feature().v && !_tensor.is_dynamic()) {
         // We support broadcast only if corresponding dimension is equal to 1.
         // Otherwise, dimensions should be equal and using "f" should be safe.
