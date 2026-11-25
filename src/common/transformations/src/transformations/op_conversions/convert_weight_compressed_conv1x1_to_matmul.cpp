@@ -136,14 +136,14 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
         auto zp = (pattern_map.count(weights_zp_m) > 0) ? pattern_map.at(weights_zp_m).get_node_shared_ptr() : nullptr;
 
         // Determine activation source based on which pattern branch matched
-        std::shared_ptr<Node> activation;
+        ov::Output<Node> activation;
         bool has_input_transpose = pattern_map.count(transpose_activations_m) > 0;
         bool has_input_reshape = pattern_map.count(reshape_activations_m) > 0;
         if (has_input_transpose || has_input_reshape) {
-            activation = pattern_map.at(first_input_m).get_node_shared_ptr();
+            activation = pattern_map.at(first_input_m);
         } else {
             // Direct activation (no transpose/reshape) - use the conv's input directly
-            activation = pattern_map.at(direct_activation_m).get_node_shared_ptr();
+            activation = pattern_map.at(direct_activation_m);
         }
 
         // Do not transform free-standing 1x1 convolutions
@@ -297,7 +297,7 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
                                                           original_reshape->get_special_zero());
                 ov::copy_runtime_info(original_shape, reshape_const);
                 ov::copy_runtime_info(reshape_activations, reshape_activations_new);
-                activation = reshape_activations_new;
+                activation = reshape_activations_new->output(0);
             }
         } else if (!has_input_transpose && !has_input_reshape) {
             // No transpose or reshape on activation input - activation is in NCHW [N, C, H, W].
@@ -306,9 +306,9 @@ ov::pass::ConvertWeightCompressedConv1x1ToMatmul::ConvertWeightCompressedConv1x1
                                                                              ov::Shape{4},
                                                                              std::vector<int64_t>{0, 2, 3, 1});
             auto transpose_input = std::make_shared<ov::op::v1::Transpose>(activation, nchw_to_nhwc_order);
-            transpose_input->set_friendly_name(activation->get_friendly_name() + "_nchw_to_nhwc");
+            transpose_input->set_friendly_name(activation.get_node_shared_ptr()->get_friendly_name() + "_nchw_to_nhwc");
             ov::copy_runtime_info(conv1x1, transpose_input);
-            activation = transpose_input;
+            activation = transpose_input->output(0);
         }
 
         auto matmul = std::make_shared<ov::op::v0::MatMul>(activation, scaled_weight, false, true);

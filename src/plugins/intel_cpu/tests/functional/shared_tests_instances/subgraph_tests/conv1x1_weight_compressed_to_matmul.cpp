@@ -60,6 +60,21 @@ INSTANTIATE_TEST_SUITE_P(smoke_Conv1x1WeightCompressedToMatmul_ReshapeInput,
                                             ::testing::Values(ov::test::utils::DEVICE_CPU)),
                          Conv1x1WeightCompressedToMatmulTest::getTestCaseName);
 
+// The activation Reshape consumes Split output port 1: pins that the conv1x1 -> MatMul conversion preserves
+// the producer's output port instead of silently rewiring the graph to port 0.
+const InputShape split_in_1x1{{-1, 256}, {{1, 256}, {3, 256}}};
+INSTANTIATE_TEST_SUITE_P(smoke_Conv1x1WeightCompressedToMatmul_SplitInput,
+                         Conv1x1WeightCompressedToMatmulTest,
+                         ::testing::Combine(::testing::Values(Conv1x1WeightCompressedShapeParams{split_in_1x1, 128}),
+                                            ::testing::Values("Split_Reshape"),
+                                            ::testing::Values("Reshape"),
+                                            ::testing::Values(ov::element::f32),
+                                            ::testing::ValuesIn(weights_precisions),
+                                            ::testing::Values(op_counts_reshape_1x1),
+                                            ::testing::Values(config),
+                                            ::testing::Values(ov::test::utils::DEVICE_CPU)),
+                         Conv1x1WeightCompressedToMatmulTest::getTestCaseName);
+
 // H*W > 1: a 1x1 Convolution producing [N, 128, 1, 55] consumed by a Reshape. Transpose after MatMul is needed
 const InputShape transpose_in_1x55{{-1, 1, 55, 128}, {{1, 1, 55, 128}, {3, 1, 55, 128}}};
 const Conv1x1ExpectedOpCounts op_counts_1xW{{"Convolution", 0}, {"FullyConnected", 1}, {"Transpose", 1}, {"Reshape", 1}};

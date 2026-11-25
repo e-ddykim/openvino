@@ -35,6 +35,21 @@ const InputShape reshape_in_1x1{{-1, 128}, {{1, 128}, {3, 128}}};
 // Preserving the batch before MatMul retains both the input and output reshapes.
 const Conv1x1ExpectedOpCounts op_counts_reshape_1x1{{"Convolution", 0}, {"FullyConnected", 1}, {"Transpose", 0}, {"Reshape", 2}};
 
+// The activation Reshape consumes Split output port 1: pins that the conv1x1 -> MatMul conversion preserves
+// the producer's output port instead of silently rewiring the graph to port 0.
+const InputShape split_in_1x1{{-1, 256}, {{1, 256}, {3, 256}}};
+INSTANTIATE_TEST_SUITE_P(smoke_Conv1x1WeightCompressedToMatmul_SplitInput,
+                         Conv1x1WeightCompressedToMatmulTest,
+                         ::testing::Combine(::testing::Values(Conv1x1WeightCompressedShapeParams{split_in_1x1, 128}),
+                                            ::testing::Values("Split_Reshape"),
+                                            ::testing::Values("Reshape"),
+                                            ::testing::Values(ov::element::f32),
+                                            ::testing::ValuesIn(weights_precisions),
+                                            ::testing::Values(op_counts_reshape_1x1),
+                                            ::testing::Values(config),
+                                            ::testing::Values(ov::test::utils::DEVICE_GPU)),
+                         Conv1x1WeightCompressedToMatmulTest::getTestCaseName);
+
 INSTANTIATE_TEST_SUITE_P(smoke_Conv1x1WeightCompressedToMatmul_ReshapeInput,
                          Conv1x1WeightCompressedToMatmulTest,
                          ::testing::Combine(::testing::Values(Conv1x1WeightCompressedShapeParams{reshape_in_1x1, 128}),
