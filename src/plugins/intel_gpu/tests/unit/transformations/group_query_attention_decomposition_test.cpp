@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "intel_gpu/op/sdpa.hpp"
@@ -69,17 +70,18 @@ struct GQAConfig {
     int64_t sequence_length = 1;
     bool present_key_slice = false;  // routes present key through a Slice before its Result
     bool present_value_nonzero_consumer_port = false;  // present_value feeds its consumer's input port 1, not 0
+    ov::Dimension head_dim = head_size;                // query / key / value head size; a 4-bit cache holds half of it
 };
 
 std::shared_ptr<ov::Model> make_gqa_model(const GQAConfig& cfg) {
     const auto f32 = ov::element::f32;
     const auto past_len = cfg.static_past_cache ? ov::Dimension{128} : ov::Dimension::dynamic();
 
-    auto query = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1, num_heads, cfg.sequence_length, head_size});
-    auto key = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1, kv_num_heads, cfg.sequence_length, head_size});
-    auto value = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1, kv_num_heads, cfg.sequence_length, head_size});
+    auto query = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1, num_heads, cfg.sequence_length, cfg.head_dim});
+    auto key = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1, kv_num_heads, cfg.sequence_length, cfg.head_dim});
+    auto value = std::make_shared<ov::op::v0::Parameter>(f32, ov::PartialShape{1, kv_num_heads, cfg.sequence_length, cfg.head_dim});
     const auto cache_type = cfg.kv_cache_bit_width ? cfg.cache_type : f32;
-    const auto cache_head_size = cfg.kv_cache_bit_width == 4 ? head_size / 2 : head_size;
+    const auto cache_head_size = cfg.kv_cache_bit_width == 4 && cfg.head_dim.is_static() ? ov::Dimension(cfg.head_dim.get_length() / 2) : cfg.head_dim;
     auto past_key = std::make_shared<ov::op::v0::Parameter>(cache_type, ov::PartialShape{1, kv_num_heads, past_len, cache_head_size});
     const auto past_value_shape =
         cfg.transpose_v ? ov::PartialShape{1, kv_num_heads, cache_head_size, past_len} : ov::PartialShape{1, kv_num_heads, past_len, cache_head_size};
@@ -724,6 +726,51 @@ TEST(GQADecompositionTest, per_channel_kv_without_immad_uses_decompressed_sdpa) 
     ASSERT_EQ(sdpa->get_input_size(), 3u) << "Q, dequantized K, dequantized V";
     EXPECT_EQ(sdpa->input_value(1).get_element_type(), ov::element::f32);
     EXPECT_EQ(sdpa->input_value(2).get_element_type(), ov::element::f32);
+}
+
+// Per-channel cache of the given head size; the scales stay static (16 channels each) under a dynamic head size.
+GQAConfig per_channel_kv_config(int64_t bit_width, const ov::element::Type& cache_type, const ov::Dimension& head_dim) {
+    GQAConfig cfg;
+    cfg.kv_cache_bit_width = bit_width;
+    cfg.kv_quant = QuantType::PER_CHANNEL;
+    cfg.out_quant = QuantType::PER_CHANNEL;
+    cfg.cache_type = cache_type;
+    cfg.head_dim = head_dim;
+    const int64_t channels = head_dim.is_static() ? head_dim.get_length() : head_size;
+    cfg.key_scale_shape = ov::PartialShape{kv_num_heads * channels};
+    cfg.value_scale_shape = ov::PartialShape{kv_num_heads * channels};
+    return cfg;
+}
+
+void expect_decompressed_sdpa(const GQAConfig& cfg) {
+    const auto sdpa = decompose_and_get_sdpa(cfg);
+    ASSERT_NE(sdpa, nullptr);
+    EXPECT_FALSE(sdpa->get_kv_compressed());
+    ASSERT_EQ(sdpa->get_input_size(), 3u) << "Q, dequantized K, dequantized V";
+    EXPECT_EQ(sdpa->input_value(1).get_element_type(), ov::element::f32);
+    EXPECT_EQ(sdpa->input_value(2).get_element_type(), ov::element::f32);
+}
+
+TEST(GQADecompositionTest, per_channel_u8_kv_uses_decompressed_sdpa) {
+    expect_decompressed_sdpa(per_channel_kv_config(8, ov::element::u8, head_size));
+}
+
+TEST(GQADecompositionTest, per_channel_kv_dynamic_head_uses_decompressed_sdpa) {
+    for (const int64_t bit_width : {8, 4}) {
+        SCOPED_TRACE("bit width " + std::to_string(bit_width));
+        expect_decompressed_sdpa(per_channel_kv_config(bit_width, ov::element::i8, ov::Dimension::dynamic()));
+    }
+}
+
+TEST(GQADecompositionTest, per_channel_kv_head_above_512_uses_decompressed_sdpa) {
+    for (const int64_t bit_width : {8, 4}) {
+        SCOPED_TRACE("bit width " + std::to_string(bit_width));
+        const auto sdpa = decompose_and_get_sdpa(per_channel_kv_config(bit_width, ov::element::i8, 512));
+        ASSERT_NE(sdpa, nullptr);
+        EXPECT_TRUE(sdpa->get_kv_compressed());
+        // At 4 bits a row of head size 576 is 288 bytes: the limit is on the head size, not on the row.
+        expect_decompressed_sdpa(per_channel_kv_config(bit_width, ov::element::i8, 576));
+    }
 }
 
 TEST(GQADecompositionTest, compressed_kv_preserves_optional_inputs) {
